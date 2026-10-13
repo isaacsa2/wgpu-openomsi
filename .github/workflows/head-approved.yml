@@ -47,6 +47,9 @@ permissions: {}
 
 jobs:
   head-approved:
+    # Forks do not have the upstream app private key. Do not run the privileged
+    # check publisher outside its configured repository; never fake a green check.
+    if: github.repository == 'openOMSI-org/wgpu-openomsi'
     name: Post head-approved check
     runs-on: ubuntu-latest
     timeout-minutes: 10
