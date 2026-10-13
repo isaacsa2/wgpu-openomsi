@@ -76,6 +76,10 @@ jobs:
       - name: Run `cargo-generate`
         run: |
           cd ..
+          # This fork checks out as wgpu-openomsi, but standalone templates and
+          # their [patch.crates-io] entries use the upstream folder name 'wgpu'.
+          # The symlink works for both the generator and the example patch path.
+          if [ ! -e wgpu ]; then ln -s "$GITHUB_WORKSPACE" wgpu; fi
           cargo generate --path "wgpu/${{ matrix.path }}" --name "${{ matrix.name }}"
 
       - name: Check generated files
