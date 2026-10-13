@@ -17,8 +17,8 @@ fn profile_gl_replay_enabled() -> bool {
 }
 
 #[cfg(gles_with_std)]
-fn should_log_gl_replay(sample: usize, elapsed: std::time::Duration) -> bool {
-    sample % 120 == 0 || elapsed >= std::time::Duration::from_millis(50)
+fn should_log_gl_replay(sample: usize, elapsed: core::time::Duration) -> bool {
+    sample % 120 == 0 || elapsed >= core::time::Duration::from_millis(50)
 }
 
 
@@ -1996,7 +1996,7 @@ unsafe impl Send for super::Queue {}
 #[cfg(all(test, gles_with_std))]
 mod gl_replay_profile_tests {
     use super::should_log_gl_replay;
-    use std::time::Duration;
+    use core::time::Duration;
 
     #[test]
     fn periodic_samples_and_slow_replays_are_logged() {
