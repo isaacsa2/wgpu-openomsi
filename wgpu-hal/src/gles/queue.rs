@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use alloc::vec;
-use core::sync::atomic::Ordering;
+use core::{ops::Range, sync::atomic::Ordering};
 
 use arrayvec::ArrayVec;
 use glow::HasContext;
@@ -8,6 +8,79 @@ use glow::HasContext;
 use super::{conv::is_layered_target, lock, Command as C, PrivateCapabilities};
 
 const DEBUG_ID: u32 = 0;
+const TEXTURE_PARAMS_CACHE_CAPACITY: usize = 32;
+
+fn state_changed<T: Copy + PartialEq>(state: &mut Option<T>, next: T) -> bool {
+    if *state == Some(next) {
+        return false;
+    }
+    *state = Some(next);
+    true
+}
+
+struct CachedTextureParams<T> {
+    texture: T,
+    target: u32,
+    aspects: crate::FormatAspects,
+    mip_levels: Range<u32>,
+}
+
+struct TextureParamsCache<T> {
+    entries: ArrayVec<CachedTextureParams<T>, TEXTURE_PARAMS_CACHE_CAPACITY>,
+    next_eviction: usize,
+}
+
+impl<T> Default for TextureParamsCache<T> {
+    fn default() -> Self {
+        Self {
+            entries: ArrayVec::new(),
+            next_eviction: 0,
+        }
+    }
+}
+
+impl<T: Copy + PartialEq> TextureParamsCache<T> {
+    fn needs_update(
+        &mut self,
+        texture: T,
+        target: u32,
+        aspects: crate::FormatAspects,
+        mip_levels: &Range<u32>,
+    ) -> bool {
+        for previous in &mut self.entries {
+            if previous.texture == texture && previous.target == target {
+                if previous.aspects == aspects && previous.mip_levels == *mip_levels {
+                    return false;
+                }
+                previous.aspects = aspects;
+                previous.mip_levels = mip_levels.clone();
+                return true;
+            }
+        }
+
+        let entry = CachedTextureParams {
+            texture,
+            target,
+            aspects,
+            mip_levels: mip_levels.clone(),
+        };
+        if self.entries.is_full() {
+            self.entries[self.next_eviction] = entry;
+            self.next_eviction = (self.next_eviction + 1) % TEXTURE_PARAMS_CACHE_CAPACITY;
+        } else {
+            self.entries.push(entry);
+        }
+        true
+    }
+}
+
+#[derive(Default)]
+struct ReplayState {
+    active_texture_unit: Option<u32>,
+    program: Option<glow::Program>,
+    texture_params: TextureParamsCache<glow::Texture>,
+}
+
 
 fn extract_marker<'a>(data: &'a [u8], range: &core::ops::Range<u32>) -> &'a str {
     core::str::from_utf8(&data[range.start as usize..range.end as usize]).unwrap()
@@ -195,6 +268,7 @@ impl super::Queue {
         command: &C,
         #[cfg_attr(target_arch = "wasm32", allow(unused))] data_bytes: &[u8],
         queries: &[glow::Query],
+        replay: &mut ReplayState,
     ) {
         match *command {
             C::Draw {
@@ -1207,6 +1281,7 @@ impl super::Queue {
                     && is_srgb
                 {
                     unsafe { self.perform_shader_clear(gl, draw_buffer, *color) };
+                    replay.program = None;
                 } else {
                     unsafe { gl.clear_buffer_f32_slice(glow::COLOR, draw_buffer, color) };
                 }
@@ -1276,7 +1351,9 @@ impl super::Queue {
                 ) {
                     flags |= glow::SHADER_STORAGE_BARRIER_BIT;
                 }
-                unsafe { gl.memory_barrier(flags) };
+                if flags != 0 {
+                    unsafe { gl.memory_barrier(flags) };
+                }
             }
             // because `STORAGE_WRITE_ONLY` and `STORAGE_READ_WRITE` are only states
             // we can transit from due OpenGL memory barriers are used to make _subsequent_
@@ -1307,7 +1384,9 @@ impl super::Queue {
                 ) {
                     flags |= glow::FRAMEBUFFER_BARRIER_BIT;
                 }
-                unsafe { gl.memory_barrier(flags) };
+                if flags != 0 {
+                    unsafe { gl.memory_barrier(flags) };
+                }
             }
             C::SetViewport {
                 ref rect,
@@ -1443,7 +1522,9 @@ impl super::Queue {
                 }
             }
             C::SetProgram(program) => {
-                unsafe { gl.use_program(Some(program)) };
+                if state_changed(&mut replay.program, program) {
+                    unsafe { gl.use_program(Some(program)) };
+                }
             }
             C::SetPrimitive(ref state) => {
                 unsafe { gl.front_face(state.front_face) };
@@ -1566,8 +1647,16 @@ impl super::Queue {
                 aspects,
                 ref mip_levels,
             } => {
-                unsafe { gl.active_texture(glow::TEXTURE0 + slot) };
+                if state_changed(&mut replay.active_texture_unit, slot) {
+                    unsafe { gl.active_texture(glow::TEXTURE0 + slot) };
+                }
                 unsafe { gl.bind_texture(target, Some(texture)) };
+                if !replay
+                    .texture_params
+                    .needs_update(texture, target, aspects, mip_levels)
+                {
+                    return;
+                }
 
                 unsafe {
                     gl.tex_parameter_i32(target, glow::TEXTURE_BASE_LEVEL, mip_levels.start as i32)
@@ -1919,8 +2008,9 @@ impl crate::Queue for super::Queue {
                 }
             }
 
+            let mut replay = ReplayState::default();
             for command in cmd_buf.commands.iter() {
-                unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries) };
+                unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries, &mut replay) };
             }
 
             if cmd_buf.label.is_some()
@@ -1961,3 +2051,44 @@ impl crate::Queue for super::Queue {
 unsafe impl Sync for super::Queue {}
 #[cfg(send_sync)]
 unsafe impl Send for super::Queue {}
+
+#[cfg(test)]
+mod replay_state_tests {
+    use super::{state_changed, TextureParamsCache};
+    use crate::FormatAspects;
+
+    #[test]
+    fn tracks_only_changes_to_active_texture_or_program() {
+        let mut current = None;
+        assert!(state_changed(&mut current, 0u32));
+        assert!(!state_changed(&mut current, 0));
+        assert!(state_changed(&mut current, 2));
+        assert!(!state_changed(&mut current, 2));
+        current = None;
+        assert!(state_changed(&mut current, 2));
+    }
+
+    #[test]
+    fn texture_parameters_track_each_texture_and_all_view_properties() {
+        let mut cache = TextureParamsCache::default();
+        let color = FormatAspects::COLOR;
+        assert!(cache.needs_update(10u32, 0x0DE1, color, &(0..4)));
+        assert!(!cache.needs_update(10, 0x0DE1, color, &(0..4)));
+        assert!(cache.needs_update(20, 0x0DE1, color, &(0..4)));
+        assert!(!cache.needs_update(10, 0x0DE1, color, &(0..4)));
+        assert!(cache.needs_update(10, 0x0DE1, color, &(1..3)));
+        assert!(cache.needs_update(10, 0x0DE1, FormatAspects::DEPTH, &(1..3)));
+        assert!(cache.needs_update(10, 0x8513, FormatAspects::DEPTH, &(1..3)));
+        assert!(!cache.needs_update(10, 0x8513, FormatAspects::DEPTH, &(1..3)));
+    }
+
+    #[test]
+    fn texture_parameters_cache_evicts_safely() {
+        let mut cache = TextureParamsCache::default();
+        for id in 0..40 {
+            assert!(cache.needs_update(id, 0x0DE1, FormatAspects::COLOR, &(0..3)));
+        }
+        assert!(!cache.needs_update(39, 0x0DE1, FormatAspects::COLOR, &(0..3)));
+        assert!(cache.needs_update(0, 0x0DE1, FormatAspects::COLOR, &(0..3)));
+    }
+}
