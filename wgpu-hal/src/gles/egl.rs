@@ -473,7 +473,9 @@ fn angle_library_path(options: &wgt::AngleOptions, name: &str) -> std::path::Pat
 
 #[cfg(any(windows, test))]
 fn has_egl_extension(extensions: &str, required: &str) -> bool {
-    extensions.split_ascii_whitespace().any(|name| name == required)
+    extensions
+        .split_ascii_whitespace()
+        .any(|name| name == required)
 }
 
 /// Gets an ANGLE display that renders with Direct3D 11.
@@ -1707,11 +1709,21 @@ mod angle_extension_tests {
 
     #[test]
     fn extension_names_must_match_whole_tokens() {
-        let extensions = "EGL_EXT_client_extensions EGL_ANGLE_platform_angle EGL_ANGLE_platform_angle_d3d";
+        let extensions =
+            "EGL_EXT_client_extensions EGL_ANGLE_platform_angle EGL_ANGLE_platform_angle_d3d";
         assert!(has_egl_extension(extensions, "EGL_ANGLE_platform_angle"));
-        assert!(has_egl_extension(extensions, "EGL_ANGLE_platform_angle_d3d"));
-        assert!(!has_egl_extension("EGL_ANGLE_platform_angle_d3d", "EGL_ANGLE_platform_angle"));
-        assert!(!has_egl_extension(extensions, "EGL_ANGLE_platform_angle_d3d9"));
+        assert!(has_egl_extension(
+            extensions,
+            "EGL_ANGLE_platform_angle_d3d"
+        ));
+        assert!(!has_egl_extension(
+            "EGL_ANGLE_platform_angle_d3d",
+            "EGL_ANGLE_platform_angle"
+        ));
+        assert!(!has_egl_extension(
+            extensions,
+            "EGL_ANGLE_platform_angle_d3d9"
+        ));
         assert!(!has_egl_extension("", "EGL_ANGLE_platform_angle"));
     }
 }
