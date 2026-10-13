@@ -82,8 +82,7 @@ struct ReplayState {
     texture_params: TextureParamsCache<glow::Texture>,
 }
 
-
-fn extract_marker<'a>(data: &'a [u8], range: &core::ops::Range<u32>) -> &'a str {
+fn extract_marker<'a>(data: &'a [u8], range: &Range<u32>) -> &'a str {
     core::str::from_utf8(&data[range.start as usize..range.end as usize]).unwrap()
 }
 
@@ -1282,7 +1281,7 @@ impl super::Queue {
                     && is_srgb
                 {
                     unsafe { self.perform_shader_clear(gl, draw_buffer, *color) };
-                    replay.program = None;
+                    unsafe { gl.use_program(replay.program) };
                 } else {
                     unsafe { gl.clear_buffer_f32_slice(glow::COLOR, draw_buffer, color) };
                 }
@@ -2083,6 +2082,11 @@ mod replay_state_tests {
         assert!(!state_changed(&mut bound_sampler, Some(1)));
         assert!(state_changed(&mut bound_sampler, None));
         assert!(!state_changed(&mut bound_sampler, None));
+
+        let mut second_slot = None;
+        assert!(state_changed(&mut second_slot, Some(1u32)));
+        assert!(!state_changed(&mut second_slot, Some(1)));
+        assert!(state_changed(&mut bound_sampler, Some(1)));
     }
 
     #[test]
