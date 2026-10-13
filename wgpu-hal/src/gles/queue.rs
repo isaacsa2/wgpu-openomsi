@@ -78,6 +78,7 @@ impl<T: Copy + PartialEq> TextureParamsCache<T> {
 struct ReplayState {
     active_texture_unit: Option<u32>,
     program: Option<glow::Program>,
+    samplers: [Option<Option<glow::Sampler>>; super::MAX_TEXTURE_SLOTS],
     texture_params: TextureParamsCache<glow::Texture>,
 }
 
@@ -1638,7 +1639,9 @@ impl super::Queue {
                 unsafe { gl.bind_buffer_range(target, slot, Some(buffer), offset, size) };
             }
             C::BindSampler(texture_index, sampler) => {
-                unsafe { gl.bind_sampler(texture_index, sampler) };
+                if state_changed(&mut replay.samplers[texture_index as usize], sampler) {
+                    unsafe { gl.bind_sampler(texture_index, sampler) };
+                }
             }
             C::BindTexture {
                 slot,
@@ -2074,6 +2077,12 @@ mod replay_state_tests {
         assert!(!state_changed(&mut current, 2));
         current = None;
         assert!(state_changed(&mut current, 2));
+
+        let mut bound_sampler = None;
+        assert!(state_changed(&mut bound_sampler, Some(1u32)));
+        assert!(!state_changed(&mut bound_sampler, Some(1)));
+        assert!(state_changed(&mut bound_sampler, None));
+        assert!(!state_changed(&mut bound_sampler, None));
     }
 
     #[test]
