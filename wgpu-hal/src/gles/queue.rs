@@ -2010,7 +2010,15 @@ impl crate::Queue for super::Queue {
 
             let mut replay = ReplayState::default();
             for command in cmd_buf.commands.iter() {
-                unsafe { self.process(gl, command, &cmd_buf.data_bytes, &cmd_buf.queries, &mut replay) };
+                unsafe {
+                    self.process(
+                        gl,
+                        command,
+                        &cmd_buf.data_bytes,
+                        &cmd_buf.queries,
+                        &mut replay,
+                    )
+                };
             }
 
             if cmd_buf.label.is_some()
