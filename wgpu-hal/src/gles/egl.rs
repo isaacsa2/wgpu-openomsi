@@ -471,6 +471,11 @@ fn angle_library_path(options: &wgt::AngleOptions, name: &str) -> std::path::Pat
     }
 }
 
+#[cfg(any(windows, test))]
+fn has_egl_extension(extensions: &str, required: &str) -> bool {
+    extensions.split_ascii_whitespace().any(|name| name == required)
+}
+
 /// Gets an ANGLE display that renders with Direct3D 11.
 ///
 /// Uses `EGL_ANGLE_platform_angle_d3d`, so ANGLE does not fall back to its Direct3D 9 renderer,
@@ -482,7 +487,7 @@ fn angle_d3d11_display(
     client_extensions: &str,
     desc: &crate::InstanceDescriptor<'_>,
 ) -> Result<khronos_egl::Display, crate::InstanceError> {
-    if !client_extensions.contains("EGL_ANGLE_platform_angle_d3d") {
+    if !has_egl_extension(client_extensions, "EGL_ANGLE_platform_angle_d3d") {
         return Err(crate::InstanceError::new(String::from(
             "the loaded libEGL.dll is not ANGLE with Direct3D 11 support \
              (EGL_ANGLE_platform_angle_d3d is missing)",
@@ -944,6 +949,15 @@ impl crate::Instance for Instance {
             client_ext_str.split_whitespace().collect::<Vec<_>>()
         );
 
+        // The Windows EGL path is dedicated to ANGLE's D3D11 renderer. Never
+        // fall through to EGL_DEFAULT_DISPLAY, which may select another API.
+        #[cfg(windows)]
+        if !has_egl_extension(&client_ext_str, "EGL_ANGLE_platform_angle") {
+            return Err(crate::InstanceError::new(String::from(
+                "ANGLE requires EGL_ANGLE_platform_angle for Direct3D 11; libEGL.dll does not advertise it",
+            )));
+        }
+
         #[cfg(not(Emscripten))]
         let egl1_5 = egl.upcast::<khronos_egl::EGL1_5>();
 
@@ -952,7 +966,7 @@ impl crate::Instance for Instance {
 
         let (display, wsi_kind) = match (desc.display.map(|d| d.as_raw()), egl1_5) {
             #[cfg(windows)]
-            (_, egl1_5) if client_ext_str.contains("EGL_ANGLE_platform_angle") => (
+            (_, egl1_5) if has_egl_extension(&client_ext_str, "EGL_ANGLE_platform_angle") => (
                 angle_d3d11_display(&egl, egl1_5, &client_ext_str, desc)?,
                 WindowKind::Unknown,
             ),
@@ -1685,4 +1699,19 @@ impl crate::Surface for Surface {
         })
     }
     unsafe fn discard_texture(&self, _texture: super::Texture) {}
+}
+
+#[cfg(test)]
+mod angle_extension_tests {
+    use super::has_egl_extension;
+
+    #[test]
+    fn extension_names_must_match_whole_tokens() {
+        let extensions = "EGL_EXT_client_extensions EGL_ANGLE_platform_angle EGL_ANGLE_platform_angle_d3d";
+        assert!(has_egl_extension(extensions, "EGL_ANGLE_platform_angle"));
+        assert!(has_egl_extension(extensions, "EGL_ANGLE_platform_angle_d3d"));
+        assert!(!has_egl_extension("EGL_ANGLE_platform_angle_d3d", "EGL_ANGLE_platform_angle"));
+        assert!(!has_egl_extension(extensions, "EGL_ANGLE_platform_angle_d3d9"));
+        assert!(!has_egl_extension("", "EGL_ANGLE_platform_angle"));
+    }
 }
