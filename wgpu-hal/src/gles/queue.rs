@@ -9,6 +9,19 @@ use super::{conv::is_layered_target, lock, Command as C, PrivateCapabilities};
 
 const DEBUG_ID: u32 = 0;
 
+// Opt-in CPU-side GL replay timing, without querying or stalling the GPU.
+#[cfg(gles_with_std)]
+fn profile_gl_replay_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WGPU_GL_PROFILE").is_some())
+}
+
+#[cfg(gles_with_std)]
+fn should_log_gl_replay(sample: usize, elapsed: std::time::Duration) -> bool {
+    sample % 120 == 0 || elapsed >= std::time::Duration::from_millis(50)
+}
+
+
 fn extract_marker<'a>(data: &'a [u8], range: &core::ops::Range<u32>) -> &'a str {
     core::str::from_utf8(&data[range.start as usize..range.end as usize]).unwrap()
 }
@@ -1897,6 +1910,8 @@ impl crate::Queue for super::Queue {
     ) -> Result<(), crate::DeviceError> {
         let shared = Arc::clone(&self.shared);
         let gl = &shared.context.try_lock()?;
+        #[cfg(gles_with_std)]
+        let replay_start = profile_gl_replay_enabled().then(std::time::Instant::now);
         for cmd_buf in command_buffers.iter() {
             // The command encoder assumes a default state when encoding the command buffer.
             // Always reset the state between command_buffers to reflect this assumption. Do
@@ -1933,6 +1948,22 @@ impl crate::Queue for super::Queue {
             }
         }
 
+        #[cfg(gles_with_std)]
+        if let Some(start) = replay_start {
+            static SAMPLES: core::sync::atomic::AtomicUsize =
+                core::sync::atomic::AtomicUsize::new(0);
+            let elapsed = start.elapsed();
+            let sample = SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_log_gl_replay(sample, elapsed) {
+                let commands: usize = command_buffers.iter().map(|buf| buf.commands.len()).sum();
+                log::info!(
+                    "OpenGL command replay: {commands} commands in {} buffers, {} us CPU wall-time (sample {sample}, no GPU synchronization)",
+                    command_buffers.len(),
+                    elapsed.as_micros()
+                );
+            }
+        }
+
         signal_fence.maintain(gl);
         signal_fence.signal(gl, signal_value)?;
 
@@ -1961,3 +1992,18 @@ impl crate::Queue for super::Queue {
 unsafe impl Sync for super::Queue {}
 #[cfg(send_sync)]
 unsafe impl Send for super::Queue {}
+
+#[cfg(all(test, gles_with_std))]
+mod gl_replay_profile_tests {
+    use super::should_log_gl_replay;
+    use std::time::Duration;
+
+    #[test]
+    fn periodic_samples_and_slow_replays_are_logged() {
+        assert!(!should_log_gl_replay(1, Duration::from_millis(2)));
+        assert!(!should_log_gl_replay(119, Duration::from_millis(2)));
+        assert!(should_log_gl_replay(120, Duration::from_millis(2)));
+        assert!(should_log_gl_replay(121, Duration::from_millis(50)));
+        assert!(!should_log_gl_replay(121, Duration::from_millis(49)));
+    }
+}
