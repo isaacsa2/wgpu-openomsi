@@ -15,6 +15,9 @@ env:
 
   # This is the MSRV used by `wgpu` itself.
   WGPU_MSRV: "1.87"
+  # Standalone templates have no pinned Cargo.lock; prefer dependencies
+  # compatible with their declared Rust 1.87 minimum supported version.
+  CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
   RUSTFLAGS: -D warnings
 
 # Every time a PR is pushed to, cancel any previous jobs. This
