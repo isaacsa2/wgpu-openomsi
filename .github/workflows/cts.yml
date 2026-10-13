@@ -1,15 +1,10 @@
 name: CTS
 
 on:
+  # Feature branches are validated by pull_request. Avoid duplicate push runs
+  # and CI floods when upstream release branches are mirrored into this fork.
   push:
-    branches-ignore: [
-        # Renovate branches are always PRs, so they will be covered
-        # by the pull_request event.
-        "renovate/**",
-        # Branches with the `gh-readonly-queue` prefix are used by the
-        # merge queue, so they are already covered by the `merge_group` event.
-        "gh-readonly-queue/**",
-      ]
+    branches: [trunk, main, openomsi/v29]
   pull_request:
   merge_group:
 
