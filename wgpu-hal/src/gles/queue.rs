@@ -18,7 +18,7 @@ fn profile_gl_replay_enabled() -> bool {
 
 #[cfg(gles_with_std)]
 fn should_log_gl_replay(sample: usize, elapsed: core::time::Duration) -> bool {
-    sample % 120 == 0 || elapsed >= core::time::Duration::from_millis(50)
+    sample.is_multiple_of(120) || elapsed >= core::time::Duration::from_millis(50)
 }
 
 
