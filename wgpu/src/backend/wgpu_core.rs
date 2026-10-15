@@ -209,6 +209,13 @@ impl ContextWgpuCore {
         unsafe { self.0.device_as_hal::<A>(device.id) }
     }
 
+    pub unsafe fn device_fence_as_hal<A: hal::Api>(
+        &self,
+        device: &CoreDevice,
+    ) -> Option<impl Deref<Target = A::Fence>> {
+        unsafe { self.0.device_fence_as_hal::<A>(device.id) }
+    }
+
     pub unsafe fn surface_as_hal<A: hal::Api>(
         &self,
         surface: &CoreSurface,
@@ -549,6 +556,7 @@ pub struct CoreCommandBuffer {
 pub struct CoreRenderBundleEncoder {
     pub(crate) context: ContextWgpuCore,
     encoder: Box<wgc::command::RenderBundleEncoder>,
+    error_sink: ErrorSink,
     id: crate::cmp::Identifier,
 }
 
@@ -706,11 +714,11 @@ impl From<CreateShaderModuleError> for CompilationInfo {
             CreateShaderModuleError::Validation(v) => v.into(),
             // Device errors are reported through the error sink, and are not compilation errors.
             // Same goes for native shader module generation errors.
-            CreateShaderModuleError::Device(_) | CreateShaderModuleError::Generation => {
-                CompilationInfo {
-                    messages: Vec::new(),
-                }
-            }
+            CreateShaderModuleError::Device(_)
+            | CreateShaderModuleError::Generation
+            | CreateShaderModuleError::Compilation(_) => CompilationInfo {
+                messages: Vec::new(),
+            },
             // Everything else is an error message without location information.
             _ => CompilationInfo {
                 messages: vec![CompilationMessage {
@@ -749,7 +757,15 @@ impl Drop for CoreBufferMappedRange {
 
 crate::cmp::impl_eq_ord_hash_arc_address!(ContextWgpuCore => .0);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreAdapter => .id);
-crate::cmp::impl_eq_ord_hash_proxy!(CoreDevice => .id);
+// (with its instance: ids are counted per instance, and devices of two instances, e.g. two
+// renderers' or tests running side by side, had compared equal)
+crate::cmp::impl_eq_ord_hash_proxy!(CoreDevice => .identity());
+
+impl CoreDevice {
+    fn identity(&self) -> (usize, wgc::id::DeviceId) {
+        (Arc::as_ptr(&self.context.0) as usize, self.id)
+    }
+}
 crate::cmp::impl_eq_ord_hash_proxy!(CoreQueue => .id);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreShaderModule => .id);
 crate::cmp::impl_eq_ord_hash_proxy!(CoreBindGroupLayout => .id);
@@ -996,6 +1012,10 @@ impl dispatch::AdapterInterface for CoreAdapter {
 
     fn get_presentation_timestamp(&self) -> crate::PresentationTimestamp {
         self.context.0.adapter_get_presentation_timestamp(self.id)
+    }
+
+    fn memory_info(&self) -> Option<crate::AdapterMemoryInfo> {
+        self.context.0.adapter_memory_info(self.id)
     }
 
     fn cooperative_matrix_properties(&self) -> Vec<crate::wgt::CooperativeMatrixProperties> {
@@ -1408,8 +1428,9 @@ impl dispatch::DeviceInterface for CoreDevice {
             .device_create_render_pipeline(self.id, &descriptor, None);
         if let Some(cause) = error {
             if let wgc::pipeline::CreateRenderPipelineError::Internal { stage, ref error } = cause {
-                log::error!("Shader translation error for stage {stage:?}: {error}");
-                log::error!("Please report it to https://github.com/gfx-rs/wgpu");
+                // (one line: a crash report that keeps the last line of the log kept only
+                // "Please report it", without the error itself)
+                log::error!("Shader translation error for stage {stage:?}: {error} (please report it to https://github.com/gfx-rs/wgpu)");
             }
             self.context.handle_error(
                 &self.error_sink,
@@ -1504,8 +1525,9 @@ impl dispatch::DeviceInterface for CoreDevice {
             .device_create_mesh_pipeline(self.id, &descriptor, None);
         if let Some(cause) = error {
             if let wgc::pipeline::CreateRenderPipelineError::Internal { stage, ref error } = cause {
-                log::error!("Shader translation error for stage {stage:?}: {error}");
-                log::error!("Please report it to https://github.com/gfx-rs/wgpu");
+                // (one line: a crash report that keeps the last line of the log kept only
+                // "Please report it", without the error itself)
+                log::error!("Shader translation error for stage {stage:?}: {error} (please report it to https://github.com/gfx-rs/wgpu)");
             }
             self.context.handle_error(
                 &self.error_sink,
@@ -1826,6 +1848,7 @@ impl dispatch::DeviceInterface for CoreDevice {
         CoreRenderBundleEncoder {
             context: self.context.clone(),
             encoder,
+            error_sink: Arc::clone(&self.error_sink),
             id: crate::cmp::Identifier::create(),
         }
         .into()
@@ -3929,8 +3952,12 @@ impl dispatch::RenderBundleEncoderInterface for CoreRenderBundleEncoder {
             None,
         );
         if let Some(err) = error {
-            self.context
-                .handle_error_fatal(err, "RenderBundleEncoder::finish");
+            self.context.handle_error(
+                &self.error_sink,
+                err,
+                desc.label,
+                "RenderBundleEncoder::finish",
+            );
         }
         CoreRenderBundle {
             context: self.context.clone(),

@@ -6,8 +6,10 @@ use glow::HasContext;
 use hashbrown::HashMap;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard, RwLock};
 
-/// The amount of time to wait while trying to obtain a lock to the adapter context
-const CONTEXT_LOCK_TIMEOUT_SECS: u64 = 6;
+/// The default amount of time to wait while trying to obtain a lock to the adapter context.
+///
+/// Can be overridden with [`wgt::GlBackendOptions::context_lock_timeout`].
+const CONTEXT_LOCK_TIMEOUT: Duration = Duration::from_secs(6);
 
 const EGL_CONTEXT_FLAGS_KHR: i32 = 0x30FC;
 const EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR: i32 = 0x0001;
@@ -19,6 +21,20 @@ const EGL_PLATFORM_XCB_SCREEN_EXT: u32 = 0x31DE;
 const EGL_PLATFORM_ANGLE_ANGLE: u32 = 0x3202;
 const EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE: u32 = 0x348F;
 const EGL_PLATFORM_ANGLE_DEBUG_LAYERS_ENABLED: u32 = 0x3451;
+#[cfg(windows)]
+const EGL_PLATFORM_ANGLE_TYPE_ANGLE: u32 = 0x3203;
+#[cfg(windows)]
+const EGL_PLATFORM_ANGLE_MAX_VERSION_MAJOR_ANGLE: u32 = 0x3204;
+#[cfg(windows)]
+const EGL_PLATFORM_ANGLE_MAX_VERSION_MINOR_ANGLE: u32 = 0x3205;
+#[cfg(windows)]
+const EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE: u32 = 0x3208;
+#[cfg(windows)]
+const EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE: u32 = 0x3209;
+#[cfg(windows)]
+const EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE: u32 = 0x320A;
+#[cfg(windows)]
+const EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE: u32 = 0x320B;
 const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
 const EGL_GL_COLORSPACE_KHR: u32 = 0x309D;
 const EGL_GL_COLORSPACE_SRGB_KHR: u32 = 0x3089;
@@ -30,6 +46,11 @@ type EglInstance = khronos_egl::DynamicInstance<khronos_egl::EGL1_4>;
 type EglInstance = khronos_egl::Instance<khronos_egl::Static>;
 
 type EglLabel = *const ffi::c_void;
+
+#[cfg(unix)]
+type WlEglWindow = *mut wayland_sys::egl::wl_egl_window;
+#[cfg(not(unix))]
+type WlEglWindow = *mut ffi::c_void;
 
 #[allow(clippy::upper_case_acronyms)]
 type EGLDEBUGPROCKHR = Option<
@@ -179,15 +200,18 @@ struct EglContext {
 
 impl EglContext {
     fn make_current(&self) {
+        self.try_make_current().unwrap();
+    }
+
+    fn try_make_current(&self) -> Result<(), khronos_egl::Error> {
         self.instance
             .make_current(self.display, self.pbuffer, self.pbuffer, Some(self.raw))
-            .unwrap();
     }
 
     fn unmake_current(&self) {
-        self.instance
-            .make_current(self.display, None, None, None)
-            .unwrap();
+        if let Err(err) = self.instance.make_current(self.display, None, None, None) {
+            log::error!("Failed to make EGL context not current: {err:?}");
+        }
     }
 }
 
@@ -197,6 +221,7 @@ impl EglContext {
 pub struct AdapterContext {
     glow: Mutex<ManuallyDrop<glow::Context>>,
     egl: Option<EglContext>,
+    lock_timeout: Duration,
 }
 
 unsafe impl Sync for AdapterContext {}
@@ -251,10 +276,18 @@ impl Drop for AdapterContext {
         // NOTE: This is only set to `None` by `Adapter::new_external` which
         // requires the context to be current when anything that may be holding
         // the `Arc<AdapterShared>` is dropped.
-        let _guard = self.egl.as_ref().map(|egl| {
-            egl.make_current();
-            CurrentGuard(egl)
-        });
+        let _guard = match self.egl.as_ref() {
+            Some(egl) => match egl.try_make_current() {
+                Ok(()) => Some(CurrentGuard(egl)),
+                Err(err) => {
+                    // The context can't be made current (for example it was lost):
+                    // leak the GL context rather than drop it without a current context.
+                    log::error!("Failed to make EGL context current to drop it: {err:?}");
+                    return;
+                }
+            },
+            None => None,
+        };
         let glow = self.glow.get_mut();
         // SAFETY: Field not used after this.
         unsafe { ManuallyDrop::drop(glow) };
@@ -306,21 +339,40 @@ impl AdapterContext {
     pub unsafe fn get_without_egl_lock(&self) -> MappedMutexGuard<'_, glow::Context> {
         let guard = self
             .glow
-            .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
+            .try_lock_for(self.lock_timeout)
             .expect("Could not lock adapter context. This is most-likely a deadlock.");
         MutexGuard::map(guard, |glow| &mut **glow)
     }
 
+    pub(super) fn set_lock_timeout(&mut self, timeout: Duration) {
+        self.lock_timeout = timeout;
+    }
+
     /// Obtain a lock to the EGL context and get handle to the [`glow::Context`] that can be used to
     /// do rendering.
+    ///
+    /// Panics if the lock cannot be obtained within the context lock timeout (see
+    /// [`wgt::GlBackendOptions::context_lock_timeout`]); [`try_lock`](Self::try_lock) returns an
+    /// error instead.
     #[track_caller]
     pub fn lock<'a>(&'a self) -> AdapterContextLock<'a> {
-        let glow = self
-            .glow
-            // Don't lock forever. If it takes longer than 1 second to get the lock we've got a
-            // deadlock and should panic to show where we got stuck
-            .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
-            .expect("Could not lock adapter context. This is most-likely a deadlock.");
+        // Don't lock forever. If it takes longer than the timeout to get the lock we've got a
+        // deadlock and should panic to show where we got stuck
+        self.try_lock()
+            .expect("Could not lock adapter context. This is most-likely a deadlock.")
+    }
+
+    /// Like [`lock`](Self::lock), but returns [`crate::DeviceError::Lost`] instead of panicking
+    /// if the lock cannot be obtained within the context lock timeout.
+    #[track_caller]
+    pub fn try_lock<'a>(&'a self) -> Result<AdapterContextLock<'a>, crate::DeviceError> {
+        let Some(glow) = self.glow.try_lock_for(self.lock_timeout) else {
+            log::error!(
+                "Could not lock adapter context within {:?}. This is most-likely a deadlock.",
+                self.lock_timeout
+            );
+            return Err(crate::DeviceError::Lost);
+        };
 
         let egl = self.egl.as_ref().map(|egl| {
             egl.make_current();
@@ -330,7 +382,7 @@ impl AdapterContext {
             }
         });
 
-        AdapterContextLock { glow, egl }
+        Ok(AdapterContextLock { glow, egl })
     }
 }
 
@@ -389,6 +441,132 @@ fn terminate_display(
 
         egl.terminate(display)
     }
+}
+
+// On Windows, the backend's `AdapterContext` and `Surface` wrap either the EGL (ANGLE) or the
+// WGL ones; elsewhere they are the EGL ones.
+#[cfg(not(windows_angle))]
+fn backend_adapter_context(context: AdapterContext) -> AdapterContext {
+    context
+}
+#[cfg(windows_angle)]
+fn backend_adapter_context(context: AdapterContext) -> super::AdapterContext {
+    super::AdapterContext::Angle(context)
+}
+#[cfg(not(windows_angle))]
+fn backend_surface(surface: Surface) -> Surface {
+    surface
+}
+#[cfg(windows_angle)]
+fn backend_surface(surface: Surface) -> super::Surface {
+    super::Surface::angle(surface)
+}
+
+/// The path ANGLE's library `name` is loaded from: the directory in
+/// [`wgt::AngleOptions::library_directory`], or else the executable's directory.
+#[cfg(windows)]
+fn angle_library_path(options: &wgt::AngleOptions, name: &str) -> std::path::PathBuf {
+    let directory = match options.library_directory {
+        Some(ref directory) => Some(std::path::PathBuf::from(directory)),
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf)),
+    };
+    match directory {
+        Some(directory) => directory.join(name),
+        None => std::path::PathBuf::from(name),
+    }
+}
+
+/// Gets an ANGLE display that renders with Direct3D 11.
+///
+/// Uses `EGL_ANGLE_platform_angle_d3d`, so ANGLE does not fall back to its Direct3D 9 renderer,
+/// which only supports OpenGL ES 2.0.
+#[cfg(windows)]
+fn angle_d3d11_display(
+    egl: &EglInstance,
+    egl1_5: Option<&khronos_egl::DynamicInstance<khronos_egl::EGL1_5>>,
+    client_extensions: &str,
+    desc: &crate::InstanceDescriptor<'_>,
+) -> Result<khronos_egl::Display, crate::InstanceError> {
+    if !client_extensions.contains("EGL_ANGLE_platform_angle_d3d") {
+        return Err(crate::InstanceError::new(String::from(
+            "the loaded libEGL.dll is not ANGLE with Direct3D 11 support \
+             (EGL_ANGLE_platform_angle_d3d is missing)",
+        )));
+    }
+    let options = &desc.backend_options.gl.angle;
+    let device_type = match options.device_type {
+        wgt::AngleDeviceType::Hardware => EGL_PLATFORM_ANGLE_DEVICE_TYPE_HARDWARE_ANGLE,
+        wgt::AngleDeviceType::Warp => EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE,
+    };
+    let mut attributes = vec![
+        EGL_PLATFORM_ANGLE_TYPE_ANGLE as khronos_egl::Attrib,
+        EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE as khronos_egl::Attrib,
+        EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE as khronos_egl::Attrib,
+        device_type as khronos_egl::Attrib,
+        EGL_PLATFORM_ANGLE_DEBUG_LAYERS_ENABLED as khronos_egl::Attrib,
+        usize::from(desc.flags.contains(wgt::InstanceFlags::VALIDATION)),
+    ];
+    if let Some((major, minor)) = options.max_feature_level {
+        attributes.extend([
+            EGL_PLATFORM_ANGLE_MAX_VERSION_MAJOR_ANGLE as khronos_egl::Attrib,
+            major as khronos_egl::Attrib,
+            EGL_PLATFORM_ANGLE_MAX_VERSION_MINOR_ANGLE as khronos_egl::Attrib,
+            minor as khronos_egl::Attrib,
+        ]);
+    }
+    attributes.push(khronos_egl::ATTRIB_NONE);
+    log::debug!(
+        "Using ANGLE platform with Direct3D 11 ({:?}, max feature level {:?})",
+        options.device_type,
+        options.max_feature_level
+    );
+
+    if let Some(egl) = egl1_5 {
+        return unsafe {
+            egl.get_platform_display(
+                EGL_PLATFORM_ANGLE_ANGLE,
+                khronos_egl::DEFAULT_DISPLAY,
+                &attributes,
+            )
+        }
+        .map_err(instance_err("failed to get ANGLE Direct3D 11 display"));
+    }
+
+    // EGL 1.4 with EGL_EXT_platform_base: the attributes are `EGLint`s.
+    type GetPlatformDisplayExt = unsafe extern "system" fn(
+        platform: khronos_egl::Enum,
+        native_display: *mut ffi::c_void,
+        attrib_list: *const khronos_egl::Int,
+    ) -> *mut ffi::c_void;
+    let function: GetPlatformDisplayExt = {
+        let address = egl
+            .get_proc_address("eglGetPlatformDisplayEXT")
+            .ok_or_else(|| {
+                crate::InstanceError::new(String::from(
+                    "failed to get `eglGetPlatformDisplayEXT` proc address",
+                ))
+            })?;
+        unsafe { core::mem::transmute(address) }
+    };
+    let attributes = attributes
+        .into_iter()
+        .map(|value| value as khronos_egl::Int)
+        .collect::<Vec<_>>();
+    let display = unsafe {
+        function(
+            EGL_PLATFORM_ANGLE_ANGLE,
+            khronos_egl::DEFAULT_DISPLAY,
+            attributes.as_ptr(),
+        )
+    };
+    if display.is_null() {
+        return Err(crate::InstanceError::new(String::from(
+            "failed to get ANGLE Direct3D 11 display",
+        )));
+    }
+    Ok(unsafe { khronos_egl::Display::from_ptr(display) })
 }
 
 fn instance_err<E: core::error::Error + Send + Sync + 'static>(
@@ -688,6 +866,10 @@ pub struct Instance {
     flags: wgt::InstanceFlags,
     options: wgt::GlBackendOptions,
     inner: Mutex<Inner>,
+    /// ANGLE's `libGLESv2.dll`, loaded before `libEGL.dll` (which loads it from its own
+    /// directory) to fail cleanly if it is missing. Dropped after `inner`.
+    #[cfg(windows)]
+    _angle_gles: libloading::Library,
 }
 
 impl Instance {
@@ -729,14 +911,24 @@ impl crate::Instance for Instance {
         let egl_result: Result<EglInstance, khronos_egl::Error> =
             Ok(khronos_egl::Instance::new(khronos_egl::Static));
 
-        #[cfg(not(Emscripten))]
-        let egl_result = if cfg!(windows) {
-            unsafe {
-                khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
-                    "libEGL.dll",
-                )
-            }
-        } else if cfg!(target_vendor = "apple") {
+        // On Windows, EGL is only used with ANGLE.
+        #[cfg(windows)]
+        let angle_gles = {
+            let path = angle_library_path(&desc.backend_options.gl.angle, "libGLESv2.dll");
+            unsafe { libloading::Library::new(&path) }.map_err(instance_err(format!(
+                "unable to open ANGLE's libGLESv2.dll from {}",
+                path.display()
+            )))?
+        };
+        #[cfg(windows)]
+        let egl_result = unsafe {
+            khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
+                angle_library_path(&desc.backend_options.gl.angle, "libEGL.dll"),
+            )
+        };
+
+        #[cfg(not(any(Emscripten, windows)))]
+        let egl_result = if cfg!(target_vendor = "apple") {
             unsafe {
                 khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
                     "libEGL.dylib",
@@ -767,6 +959,11 @@ impl crate::Instance for Instance {
         let egl1_5: Option<&Arc<EglInstance>> = Some(&egl);
 
         let (display, wsi_kind) = match (desc.display.map(|d| d.as_raw()), egl1_5) {
+            #[cfg(windows)]
+            (_, egl1_5) if client_ext_str.contains("EGL_ANGLE_platform_angle") => (
+                angle_d3d11_display(&egl, egl1_5, &client_ext_str, desc)?,
+                WindowKind::Unknown,
+            ),
             (Some(Rdh::Wayland(wayland_display_handle)), Some(egl))
                 if client_ext_str.contains("EGL_EXT_platform_wayland") =>
             {
@@ -915,6 +1112,8 @@ impl crate::Instance for Instance {
             flags: desc.flags,
             options: desc.backend_options.gl.clone(),
             inner: Mutex::new(inner),
+            #[cfg(windows)]
+            _angle_gles: angle_gles,
         })
     }
 
@@ -922,7 +1121,7 @@ impl crate::Instance for Instance {
         &self,
         display_handle: raw_window_handle::RawDisplayHandle,
         window_handle: raw_window_handle::RawWindowHandle,
-    ) -> Result<Surface, crate::InstanceError> {
+    ) -> Result<<super::Api as crate::Api>::Surface, crate::InstanceError> {
         use raw_window_handle::RawWindowHandle as Rwh;
 
         let inner = self.inner.lock();
@@ -975,7 +1174,7 @@ impl crate::Instance for Instance {
 
         inner.egl.unmake_current();
 
-        Ok(Surface {
+        Ok(backend_surface(Surface {
             egl: inner.egl.clone(),
             wsi: self.wsi.clone(),
             config: inner.config,
@@ -983,15 +1182,18 @@ impl crate::Instance for Instance {
             raw_window_handle: window_handle,
             swapchain: RwLock::new(None),
             srgb_kind: inner.srgb_kind,
-        })
+        }))
     }
 
     unsafe fn enumerate_adapters(
         &self,
-        _surface_hint: Option<&Surface>,
+        _surface_hint: Option<&<super::Api as crate::Api>::Surface>,
     ) -> Vec<crate::ExposedAdapter<super::Api>> {
         let inner = self.inner.lock();
-        inner.egl.make_current();
+        if let Err(err) = inner.egl.try_make_current() {
+            log::error!("Failed to make EGL context current, no adapter exposed: {err:?}");
+            return Vec::new();
+        }
 
         let mut gl = unsafe {
             glow::Context::from_loader_function(|name| {
@@ -1029,11 +1231,12 @@ impl crate::Instance for Instance {
 
         unsafe {
             super::Adapter::expose(
-                AdapterContext {
+                backend_adapter_context(AdapterContext {
                     glow: Mutex::new(gl),
                     // ERROR: Copying owned reference handles here, be careful to not drop them!
                     egl: Some(inner.egl.clone()),
-                },
+                    lock_timeout: CONTEXT_LOCK_TIMEOUT,
+                }),
                 self.options.clone(),
             )
         }
@@ -1042,6 +1245,8 @@ impl crate::Instance for Instance {
     }
 }
 
+// On Windows, the WGL module provides these for both platforms.
+#[cfg(not(windows_angle))]
 impl super::Adapter {
     /// Creates a new external adapter using the specified loader function.
     ///
@@ -1062,6 +1267,7 @@ impl super::Adapter {
                 AdapterContext {
                     glow: Mutex::new(ManuallyDrop::new(context)),
                     egl: None,
+                    lock_timeout: CONTEXT_LOCK_TIMEOUT,
                 },
                 options,
             )
@@ -1073,6 +1279,7 @@ impl super::Adapter {
     }
 }
 
+#[cfg(not(windows_angle))]
 impl super::Device {
     /// Returns the underlying EGL context.
     pub fn context(&self) -> &AdapterContext {
@@ -1083,7 +1290,7 @@ impl super::Device {
 #[derive(Debug)]
 pub struct Swapchain {
     surface: khronos_egl::Surface,
-    wl_window: Option<*mut wayland_sys::egl::wl_egl_window>,
+    wl_window: Option<WlEglWindow>,
     framebuffer: glow::Framebuffer,
     renderbuffer: glow::Renderbuffer,
     /// Extent because the window lies
@@ -1092,6 +1299,9 @@ pub struct Swapchain {
     format_desc: super::TextureFormatDesc,
     #[allow(unused)]
     sample_type: wgt::TextureSampleType,
+    /// The `eglSwapInterval` for the configured present mode, if it is set (only on Windows,
+    /// where Fifo and Immediate are supported).
+    swap_interval: Option<khronos_egl::Int>,
 }
 
 #[derive(Debug)]
@@ -1132,6 +1342,12 @@ impl Surface {
                 log::error!("make_current(surface) failed: {e}");
                 crate::SurfaceError::Lost
             })?;
+
+        if let Some(interval) = sc.swap_interval {
+            if let Err(e) = self.egl.instance.swap_interval(self.egl.display, interval) {
+                log::warn!("swap_interval({interval}) failed: {e}");
+            }
+        }
 
         unsafe { gl.disable(glow::SCISSOR_TEST) };
         unsafe { gl.color_mask(true, true, true, true) };
@@ -1191,10 +1407,7 @@ impl Surface {
     unsafe fn unconfigure_impl(
         &self,
         device: &super::Device,
-    ) -> Option<(
-        khronos_egl::Surface,
-        Option<*mut wayland_sys::egl::wl_egl_window>,
-    )> {
+    ) -> Option<(khronos_egl::Surface, Option<WlEglWindow>)> {
         let gl = &device.shared.context.lock();
         match self.swapchain.write().take() {
             Some(sc) => {
@@ -1226,6 +1439,7 @@ impl crate::Surface for Surface {
 
         let (surface, wl_window) = match unsafe { self.unconfigure_impl(device) } {
             Some((sc, wl_window)) => {
+                #[cfg(unix)]
                 if let Some(window) = wl_window {
                     wayland_sys::ffi_dispatch!(
                         wayland_sys::egl::wayland_egl_handle(),
@@ -1241,6 +1455,7 @@ impl crate::Surface for Surface {
                 (sc, wl_window)
             }
             None => {
+                #[cfg_attr(not(unix), allow(unused_mut))] // only set for Wayland
                 let mut wl_window = None;
                 let (mut temp_xlib_handle, mut temp_xcb_handle);
                 let native_window_ptr = match (self.wsi.kind, self.raw_window_handle) {
@@ -1406,6 +1621,16 @@ impl crate::Surface for Surface {
         unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, None) };
         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
+        // Only Windows advertises more than Fifo; other platforms keep the driver's default.
+        let swap_interval = if cfg!(windows) {
+            Some(match config.present_mode {
+                wgt::PresentMode::Immediate => 0,
+                _ => 1,
+            })
+        } else {
+            None
+        };
+
         let mut swapchain = self.swapchain.write();
         *swapchain = Some(Swapchain {
             surface,
@@ -1416,6 +1641,7 @@ impl crate::Surface for Surface {
             format: config.format,
             format_desc,
             sample_type: wgt::TextureSampleType::Float { filterable: false },
+            swap_interval,
         });
 
         Ok(())
@@ -1423,10 +1649,10 @@ impl crate::Surface for Surface {
 
     unsafe fn unconfigure(&self, device: &super::Device) {
         if let Some((surface, wl_window)) = unsafe { self.unconfigure_impl(device) } {
-            self.egl
-                .instance
-                .destroy_surface(self.egl.display, surface)
-                .unwrap();
+            if let Err(err) = self.egl.instance.destroy_surface(self.egl.display, surface) {
+                log::error!("Failed to destroy EGL surface: {err:?}");
+            }
+            #[cfg(unix)]
             if let Some(window) = wl_window {
                 wayland_sys::ffi_dispatch!(
                     wayland_sys::egl::wayland_egl_handle(),
@@ -1434,6 +1660,8 @@ impl crate::Surface for Surface {
                     window,
                 );
             }
+            #[cfg(not(unix))]
+            let _ = wl_window;
         }
     }
 

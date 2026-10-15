@@ -10,5 +10,6 @@ mod experimental;
 mod external_texture;
 mod immediates;
 mod instance;
+mod render_bundle;
 mod render_pipeline;
 mod texture;

@@ -142,6 +142,7 @@ OpRayQueryInitializeKHR %38 %39 %46 %47 %50 %48 %51 %49
 OpStore %41 %86
 OpBranch %116
 %117 = OpLabel
+OpStore %43 %31
 OpBranch %116
 %116 = OpLabel
 OpReturn

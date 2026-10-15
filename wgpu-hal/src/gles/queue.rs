@@ -1906,14 +1906,25 @@ impl crate::Queue for super::Queue {
         _surface_textures: &[&super::Texture],
         (signal_fence, signal_value): (&super::Fence, crate::FenceValue),
     ) -> Result<(), crate::DeviceError> {
+        #[cfg(native)]
+        let mut timing = super::submit_profile::Sample::begin();
         let shared = Arc::clone(&self.shared);
-        let gl = &shared.context.lock();
+        let context = shared.context.try_lock()?;
+        let gl = &*context;
+        #[cfg(native)]
+        if let Some(t) = timing.as_mut() {
+            t.mark(0);
+        }
         for cmd_buf in command_buffers.iter() {
             // The command encoder assumes a default state when encoding the command buffer.
             // Always reset the state between command_buffers to reflect this assumption. Do
             // this at the beginning of the loop in case something outside of wgpu modified
             // this state prior to commit.
             unsafe { self.reset_state(gl) };
+            #[cfg(native)]
+            if let Some(t) = timing.as_mut() {
+                t.mark(1);
+            }
             if let Some(ref label) = cmd_buf.label {
                 if self
                     .shared
@@ -1942,15 +1953,35 @@ impl crate::Queue for super::Queue {
             {
                 unsafe { gl.pop_debug_group() };
             }
+            #[cfg(native)]
+            if let Some(t) = timing.as_mut() {
+                t.mark(2);
+            }
         }
 
         signal_fence.maintain(gl);
         signal_fence.signal(gl, signal_value)?;
+        #[cfg(native)]
+        if let Some(t) = timing.as_mut() {
+            t.mark(3);
+        }
 
         // This is extremely important. If we don't flush, the above fences may never
         // be signaled, particularly in headless contexts. Headed contexts will
         // often flush every so often, but headless contexts may not.
         unsafe { gl.flush() };
+        #[cfg(native)]
+        if let Some(t) = timing.as_mut() {
+            t.mark(4);
+        }
+        drop(context);
+        #[cfg(native)]
+        if let Some(t) = timing {
+            t.finish(
+                command_buffers.len(),
+                command_buffers.iter().map(|b| b.commands.len()).sum(),
+            );
+        }
 
         Ok(())
     }

@@ -23,6 +23,10 @@ type ShaderStage<'a> = (
 );
 type NameBindingMap = FastHashMap<String, (super::BindingRegister, u8)>;
 
+/// The longest [`crate::Device::wait`] holds the GL context in one go while blocking on a fence.
+#[cfg(not(any(webgl, Emscripten)))]
+const FENCE_WAIT_SLICE: core::time::Duration = core::time::Duration::from_millis(5);
+
 struct CompilationContext<'a> {
     layout: &'a super::PipelineLayout,
     sampler_map: &'a mut super::SamplerBindMap,
@@ -260,7 +264,12 @@ impl super::Device {
             | naga::ShaderStage::Miss => unreachable!(),
         };
 
-        let raw = unsafe { gl.create_shader(target) }.unwrap();
+        let raw = unsafe { gl.create_shader(target) }.map_err(|e| {
+            crate::PipelineError::Linkage(
+                map_naga_stage(naga_stage),
+                format!("glCreateShader failed: {e}"),
+            )
+        })?;
         #[cfg(native)]
         if gl.supports_debug() {
             let name = raw.0.get();
@@ -280,6 +289,13 @@ impl super::Device {
             }
             Ok(raw)
         } else {
+            // (some drivers - ANGLE on an old Direct3D 11 one - fail without a word: say so,
+            // the error read "Internal error in VERTEX shader:" and nothing after it)
+            let msg = if msg.trim().is_empty() {
+                "the driver compiled it with an error and gave no log".to_string()
+            } else {
+                msg
+            };
             log::error!("\tShader compilation failed: {msg}");
             unsafe { gl.delete_shader(raw) };
             Err(crate::PipelineError::Linkage(
@@ -289,13 +305,15 @@ impl super::Device {
         }
     }
 
-    fn create_shader(
+    /// The GLSL naga writes for a stage (its reflection goes into `context`); compiled by
+    /// `create_program`, or not at all when the program comes from the pipeline cache.
+    fn translate_shader(
         gl: &glow::Context,
         naga_stage: naga::ShaderStage,
         stage: &crate::ProgrammableStage<super::ShaderModule>,
         context: CompilationContext,
         program: glow::Program,
-    ) -> Result<glow::Shader, crate::PipelineError> {
+    ) -> Result<String, crate::PipelineError> {
         let source = 'outer: {
             use naga::back::glsl;
             let pipeline_options = glsl::PipelineOptions {
@@ -392,7 +410,7 @@ impl super::Device {
             Cow::Owned(output)
         };
 
-        unsafe { Self::compile_shader(gl, &source, naga_stage, stage.module.label.as_deref()) }
+        Ok(source.into_owned())
     }
 
     unsafe fn create_pipeline<'a>(
@@ -402,6 +420,7 @@ impl super::Device {
         layout: &super::PipelineLayout,
         #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
         multiview_mask: Option<NonZeroU32>,
+        cache: Option<&super::PipelineCache>,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let mut program_stages = ArrayVec::new();
         let group_to_binding_to_slot = layout
@@ -439,6 +458,7 @@ impl super::Device {
                     multiview_mask,
                     self.shared.shading_language_version,
                     self.shared.private_caps,
+                    cache,
                 )
             })
             .to_owned()?;
@@ -458,6 +478,7 @@ impl super::Device {
         buf
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn create_program<'a>(
         gl: &glow::Context,
         shaders: ArrayVec<ShaderStage<'a>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
@@ -466,12 +487,20 @@ impl super::Device {
         multiview_mask: Option<NonZeroU32>,
         glsl_version: naga::back::glsl::Version,
         private_caps: PrivateCapabilities,
+        cache: Option<&super::PipelineCache>,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let glsl_version = match glsl_version {
             naga::back::glsl::Version::Embedded { version, .. } => format!("{version} es"),
             naga::back::glsl::Version::Desktop(version) => format!("{version}"),
         };
-        let program = unsafe { gl.create_program() }.unwrap();
+        let program = unsafe { gl.create_program() }.map_err(|e| {
+            let stages = shaders
+                .iter()
+                .fold(wgt::ShaderStages::empty(), |stages, &(naga_stage, _)| {
+                    stages | map_naga_stage(naga_stage)
+                });
+            crate::PipelineError::Linkage(stages, format!("glCreateProgram failed: {e}"))
+        })?;
         #[cfg(native)]
         if let Some(label) = label {
             if private_caps.contains(PrivateCapabilities::DEBUG_FNS) {
@@ -484,7 +513,10 @@ impl super::Device {
         let mut immediates_items = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
         let mut sampler_map = [None; super::MAX_TEXTURE_SLOTS];
         let mut has_stages = wgt::ShaderStages::empty();
-        let mut shaders_to_delete = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
+        let mut sources = ArrayVec::<
+            (naga::ShaderStage, String, Option<&str>),
+            { crate::MAX_CONCURRENT_SHADER_STAGES + 1 },
+        >::new();
         let mut clip_distance_count = 0;
 
         for &(naga_stage, stage) in &shaders {
@@ -502,39 +534,96 @@ impl super::Device {
                 clip_distance_count: &mut clip_distance_count,
             };
 
-            let shader = Self::create_shader(gl, naga_stage, stage, context, program)?;
-            shaders_to_delete.push(shader);
+            let source = Self::translate_shader(gl, naga_stage, stage, context, program)?;
+            sources.push((naga_stage, source, stage.module.label.as_deref()));
         }
 
         // Create empty fragment shader if only vertex shader is present
         if has_stages == wgt::ShaderStages::VERTEX {
-            let shader_src = format!("#version {glsl_version}\n void main(void) {{}}",);
             log::debug!("Only vertex shader is present. Creating an empty fragment shader",);
-            let shader = unsafe {
-                Self::compile_shader(
-                    gl,
-                    &shader_src,
-                    naga::ShaderStage::Fragment,
-                    Some("(wgpu internal) dummy fragment shader"),
-                )
-            }?;
-            shaders_to_delete.push(shader);
+            sources.push((
+                naga::ShaderStage::Fragment,
+                format!("#version {glsl_version}\n void main(void) {{}}",),
+                Some("(wgpu internal) dummy fragment shader"),
+            ));
         }
 
-        for &shader in shaders_to_delete.iter() {
-            unsafe { gl.attach_shader(program, shader) };
+        // The program as the pipeline cache keeps it, by its GLSL: no compile and no link
+        // when the driver takes the binary back (on Android and over ANGLE these are the
+        // slow part of starting a renderer), else built and kept for the next time.
+        #[cfg_attr(not(native), allow(unused_variables))]
+        let key = cache.map(|_| super::PipelineCache::key(&glsl_version, &sources));
+        #[cfg_attr(not(native), allow(unused_mut))]
+        let mut from_cache = false;
+        #[cfg(native)]
+        if let (Some(cache), Some(key)) = (cache, key) {
+            if let Some((format, buffer)) = cache.programs.lock().get(&key).cloned() {
+                unsafe { gl.program_binary(program, &glow::ProgramBinary { buffer, format }) };
+                from_cache = unsafe { gl.get_program_link_status(program) };
+                if !from_cache {
+                    log::debug!("\tThe driver refused the cached binary of program {program:?}; compiling it");
+                    cache.programs.lock().remove(&key);
+                }
+            }
         }
-        unsafe { gl.link_program(program) };
 
-        for shader in shaders_to_delete {
-            unsafe { gl.delete_shader(shader) };
+        if !from_cache {
+            let mut shaders_to_delete =
+                ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES + 1 }>::new();
+            for (naga_stage, source, label) in &sources {
+                let shader = unsafe { Self::compile_shader(gl, source, *naga_stage, *label) };
+                match shader {
+                    Ok(shader) => shaders_to_delete.push(shader),
+                    Err(e) => {
+                        for shader in shaders_to_delete {
+                            unsafe { gl.delete_shader(shader) };
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            for &shader in shaders_to_delete.iter() {
+                unsafe { gl.attach_shader(program, shader) };
+            }
+            #[cfg(native)]
+            if cache.is_some() {
+                unsafe { gl.program_binary_retrievable_hint(program, true) };
+            }
+            unsafe { gl.link_program(program) };
+
+            for shader in shaders_to_delete {
+                unsafe { gl.delete_shader(shader) };
+            }
         }
 
         log::debug!("\tLinked program {program:?}");
 
         let linked_ok = unsafe { gl.get_program_link_status(program) };
-        let msg = unsafe { gl.get_program_info_log(program) };
+        let msg = if from_cache {
+            String::new()
+        } else {
+            unsafe { gl.get_program_info_log(program) }
+        };
+        #[cfg(native)]
+        if linked_ok && !from_cache {
+            if let (Some(cache), Some(key)) = (cache, key) {
+                if let Some(binary) = unsafe { gl.get_program_binary(program) } {
+                    if !binary.buffer.is_empty() {
+                        cache
+                            .programs
+                            .lock()
+                            .insert(key, (binary.format, binary.buffer));
+                    }
+                }
+            }
+        }
         if !linked_ok {
+            let msg = if msg.trim().is_empty() {
+                "the driver failed to link the program and gave no log".to_string()
+            } else {
+                msg
+            };
+            log::error!("\tProgram link failed: {msg}");
             return Err(crate::PipelineError::Linkage(has_stages, msg));
         }
         if !msg.is_empty() {
@@ -549,7 +638,12 @@ impl super::Device {
                 log::trace!("Get binding {name:?} from program {program:?}");
                 match register {
                     super::BindingRegister::UniformBuffers => {
-                        let index = unsafe { gl.get_uniform_block_index(program, name) }.unwrap();
+                        // The driver may have optimized the block away.
+                        let Some(index) = (unsafe { gl.get_uniform_block_index(program, name) })
+                        else {
+                            log::debug!("\tUniform block {name:?} is not active");
+                            continue;
+                        };
                         log::trace!("\tBinding slot {slot} to block index {index}");
                         unsafe { gl.uniform_block_binding(program, index, slot as _) };
                     }
@@ -646,7 +740,7 @@ impl crate::Device for super::Device {
             });
         }
 
-        let gl = &self.shared.context.lock();
+        let gl = &self.shared.context.try_lock()?;
 
         let target = if desc.usage.contains(wgt::BufferUses::INDEX) {
             glow::ELEMENT_ARRAY_BUFFER
@@ -783,7 +877,7 @@ impl crate::Device for super::Device {
                 slice.as_mut_ptr()
             }
             Some(raw) => {
-                let gl = &self.shared.context.lock();
+                let gl = &self.shared.context.try_lock()?;
                 unsafe { gl.bind_buffer(buffer.target, Some(raw)) };
                 let mut map_state = lock(&buffer.map_state);
                 let ptr = if let Some(map_read_allocation) = map_state.data.as_mut() {
@@ -871,7 +965,7 @@ impl crate::Device for super::Device {
         &self,
         desc: &crate::TextureDescriptor,
     ) -> Result<super::Texture, crate::DeviceError> {
-        let gl = &self.shared.context.lock();
+        let gl = &self.shared.context.try_lock()?;
 
         let render_usage = wgt::TextureUses::COLOR_TARGET
             | wgt::TextureUses::DEPTH_STENCIL_WRITE
@@ -1156,7 +1250,7 @@ impl crate::Device for super::Device {
         &self,
         desc: &crate::SamplerDescriptor,
     ) -> Result<super::Sampler, crate::DeviceError> {
-        let gl = &self.shared.context.lock();
+        let gl = &self.shared.context.try_lock()?;
 
         let raw = unsafe { gl.create_sampler().unwrap() };
 
@@ -1519,14 +1613,21 @@ impl crate::Device for super::Device {
             } => (vertex_stage, vertex_buffers),
             crate::VertexProcessor::Mesh { .. } => unreachable!(),
         };
-        let gl = &self.shared.context.lock();
+        let gl = &self.shared.context.try_lock()?;
         let mut shaders = ArrayVec::new();
         shaders.push((naga::ShaderStage::Vertex, vertex_stage));
         if let Some(ref fs) = desc.fragment_stage {
             shaders.push((naga::ShaderStage::Fragment, fs));
         }
         let inner = unsafe {
-            self.create_pipeline(gl, shaders, desc.layout, desc.label, desc.multiview_mask)
+            self.create_pipeline(
+                gl,
+                shaders,
+                desc.layout,
+                desc.label,
+                desc.multiview_mask,
+                desc.cache,
+            )
         }?;
 
         let (vertex_buffers, vertex_attributes) = {
@@ -1619,10 +1720,12 @@ impl crate::Device for super::Device {
             super::PipelineCache,
         >,
     ) -> Result<super::ComputePipeline, crate::PipelineError> {
-        let gl = &self.shared.context.lock();
+        let gl = &self.shared.context.try_lock()?;
         let mut shaders = ArrayVec::new();
         shaders.push((naga::ShaderStage::Compute, &desc.stage));
-        let inner = unsafe { self.create_pipeline(gl, shaders, desc.layout, desc.label, None) }?;
+        let inner = unsafe {
+            self.create_pipeline(gl, shaders, desc.layout, desc.label, None, desc.cache)
+        }?;
 
         self.counters.compute_pipelines.add(1);
 
@@ -1672,11 +1775,20 @@ impl crate::Device for super::Device {
 
     unsafe fn create_pipeline_cache(
         &self,
-        _: &crate::PipelineCacheDescriptor<'_>,
+        desc: &crate::PipelineCacheDescriptor<'_>,
     ) -> Result<super::PipelineCache, crate::PipelineCacheError> {
-        // Even though the cache doesn't do anything, we still return something here
-        // as the least bad option
-        Ok(super::PipelineCache)
+        // (without `Features::PIPELINE_CACHE` - no binary formats - it holds nothing and the
+        // programs are compiled as before)
+        Ok(desc
+            .data
+            .map(super::PipelineCache::from_data)
+            .unwrap_or_default())
+    }
+    fn pipeline_cache_validation_key(&self) -> Option<[u8; 16]> {
+        Some(self.shared.pipeline_cache_validation_key)
+    }
+    unsafe fn pipeline_cache_get_data(&self, cache: &super::PipelineCache) -> Option<Vec<u8>> {
+        Some(cache.to_data())
     }
     unsafe fn destroy_pipeline_cache(&self, _: super::PipelineCache) {}
 
@@ -1685,7 +1797,7 @@ impl crate::Device for super::Device {
         &self,
         desc: &wgt::QuerySetDescriptor<crate::Label>,
     ) -> Result<super::QuerySet, crate::DeviceError> {
-        let gl = &self.shared.context.lock();
+        let gl = &self.shared.context.try_lock()?;
 
         let mut queries = Vec::with_capacity(desc.count as usize);
         for _ in 0..desc.count {
@@ -1736,8 +1848,8 @@ impl crate::Device for super::Device {
         &self,
         fence: &super::Fence,
     ) -> Result<crate::FenceValue, crate::DeviceError> {
-        #[cfg_attr(target_arch = "wasm32", allow(clippy::needless_borrow))]
-        Ok(fence.get_latest(&self.shared.context.lock()))
+        let gl = &self.shared.context.try_lock()?;
+        Ok(fence.get_latest(gl))
     }
     unsafe fn wait(
         &self,
@@ -1749,19 +1861,48 @@ impl crate::Device for super::Device {
             return Ok(true);
         }
 
-        let gl = &self.shared.context.lock();
         // MAX_CLIENT_WAIT_TIMEOUT_WEBGL is:
         // - 1s in Gecko https://searchfox.org/mozilla-central/rev/754074e05178e017ef6c3d8e30428ffa8f1b794d/dom/canvas/WebGLTypes.h#1386
         // - 0 in WebKit https://github.com/WebKit/WebKit/blob/4ef90d4672ca50267c0971b85db403d9684508ea/Source/WebCore/html/canvas/WebGL2RenderingContext.cpp#L110
         // - 0 in Chromium https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/modules/webgl/webgl2_rendering_context_base.cc;l=112;drc=a3cb0ac4c71ec04abfeaed199e5d63230eca2551
-        let timeout_ns = if cfg!(any(webgl, Emscripten)) {
-            0
-        } else {
-            timeout
-                .map(|t| t.as_nanos().min(u32::MAX as u128) as u32)
-                .unwrap_or(u32::MAX)
-        };
-        fence.wait(gl, wait_value, timeout_ns)
+        #[cfg(any(webgl, Emscripten))]
+        {
+            let _ = timeout;
+            let gl = &self.shared.context.try_lock()?;
+            fence.wait(gl, wait_value, 0)
+        }
+        #[cfg(not(any(webgl, Emscripten)))]
+        {
+            if !fence.can_block_on(wait_value) {
+                let gl = &self.shared.context.try_lock()?;
+                return fence.wait(gl, wait_value, 0);
+            }
+
+            // `glClientWaitSync` takes the timeout as a signed 32-bit number of nanoseconds, so a
+            // wait has always been capped to about 2.1 seconds.
+            let max_timeout = core::time::Duration::from_nanos(i32::MAX as u64);
+            let timeout = timeout.map_or(max_timeout, |t| t.min(max_timeout));
+
+            // The GL context is shared by every thread using the device, and stays locked for as
+            // long as we block in `glClientWaitSync`. Wait in short slices, unlocking the context
+            // in between, so that other threads are not locked out (and do not time out on the
+            // lock) for the whole wait.
+            let start = std::time::Instant::now();
+            loop {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                let slice = remaining.min(FENCE_WAIT_SLICE);
+                {
+                    let gl = &self.shared.context.try_lock()?;
+                    if fence.wait(gl, wait_value, slice.as_nanos() as u32)? {
+                        return Ok(true);
+                    }
+                }
+                if remaining <= slice {
+                    return Ok(false);
+                }
+                std::thread::yield_now();
+            }
+        }
     }
 
     unsafe fn start_graphics_debugger_capture(&self) -> bool {

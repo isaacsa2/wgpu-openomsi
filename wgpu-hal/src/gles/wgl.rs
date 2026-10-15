@@ -37,13 +37,16 @@ use windows::{
     },
 };
 
-/// The amount of time to wait while trying to obtain a lock to the adapter context
-const CONTEXT_LOCK_TIMEOUT_SECS: u64 = 1;
+/// The default amount of time to wait while trying to obtain a lock to the adapter context.
+///
+/// Can be overridden with [`wgt::GlBackendOptions::context_lock_timeout`].
+const CONTEXT_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A wrapper around a `[`glow::Context`]` and the required WGL context that uses locking to
 /// guarantee exclusive access when shared with multiple threads.
 pub struct AdapterContext {
     inner: Arc<Mutex<Inner>>,
+    lock_timeout: Duration,
 }
 
 #[cfg(send_sync)]
@@ -61,22 +64,46 @@ impl AdapterContext {
         }
     }
 
+    pub(super) fn set_lock_timeout(&mut self, timeout: Duration) {
+        self.lock_timeout = timeout;
+    }
+
     /// Obtain a lock to the WGL context and get handle to the [`glow::Context`] that can be used to
     /// do rendering.
+    ///
+    /// Panics if the lock cannot be obtained within the context lock timeout (see
+    /// [`wgt::GlBackendOptions::context_lock_timeout`]); [`try_lock`](Self::try_lock) returns an
+    /// error instead.
     #[track_caller]
     pub fn lock(&self) -> AdapterContextLock<'_> {
-        let inner = self
-            .inner
-            // Don't lock forever. If it takes longer than 1 second to get the lock we've got a
-            // deadlock and should panic to show where we got stuck
-            .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
-            .expect("Could not lock adapter context. This is most-likely a deadlock.");
+        // Don't lock forever. If it takes longer than the timeout to get the lock we've got a
+        // deadlock and should panic to show where we got stuck
+        self.try_lock()
+            .expect("Could not lock adapter context. This is most-likely a deadlock.")
+    }
+
+    /// Like [`lock`](Self::lock), but returns [`crate::DeviceError::Lost`] instead of panicking
+    /// if the lock cannot be obtained within the context lock timeout.
+    #[track_caller]
+    pub fn try_lock(&self) -> Result<AdapterContextLock<'_>, crate::DeviceError> {
+        let inner = self.lock_inner().ok_or(crate::DeviceError::Lost)?;
 
         if let Some(wgl) = &inner.context {
             wgl.make_current(inner.device.dc).unwrap()
         };
 
-        AdapterContextLock { inner }
+        Ok(AdapterContextLock { inner })
+    }
+
+    fn lock_inner(&self) -> Option<MutexGuard<'_, Inner>> {
+        let inner = self.inner.try_lock_for(self.lock_timeout);
+        if inner.is_none() {
+            log::error!(
+                "Could not lock adapter context within {:?}. This is most-likely a deadlock.",
+                self.lock_timeout
+            );
+        }
+        inner
     }
 
     /// Obtain a lock to the WGL context and get handle to the [`glow::Context`] that can be used to
@@ -85,10 +112,12 @@ impl AdapterContext {
     /// Unlike [`lock`](Self::lock), this accepts a device to pass to `make_current` and exposes the error
     /// when `make_current` fails.
     #[track_caller]
-    fn lock_with_dc(&self, device: Gdi::HDC) -> windows::core::Result<AdapterContextLock<'_>> {
+    pub(super) fn lock_with_dc(
+        &self,
+        device: Gdi::HDC,
+    ) -> windows::core::Result<AdapterContextLock<'_>> {
         let inner = self
-            .inner
-            .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
+            .lock_inner()
             .expect("Could not lock adapter context. This is most-likely a deadlock.");
 
         if let Some(wgl) = &inner.context {
@@ -115,7 +144,9 @@ impl<'a> core::ops::Deref for AdapterContextLock<'a> {
 impl<'a> Drop for AdapterContextLock<'a> {
     fn drop(&mut self) {
         if let Some(wgl) = &self.inner.context {
-            wgl.unmake_current().unwrap()
+            if let Err(err) = wgl.unmake_current() {
+                log::error!("Failed to make WGL context not current: {err}");
+            }
         }
     }
 }
@@ -159,7 +190,9 @@ impl Drop for Inner {
         struct CurrentGuard<'a>(&'a WglContext);
         impl Drop for CurrentGuard<'_> {
             fn drop(&mut self) {
-                self.0.unmake_current().unwrap();
+                if let Err(err) = self.0.unmake_current() {
+                    log::error!("Failed to make WGL context not current: {err}");
+                }
             }
         }
 
@@ -169,10 +202,18 @@ impl Drop for Inner {
         // NOTE: This is only set to `None` by `Adapter::new_external` which
         // requires the context to be current when anything that may be holding
         // the `Arc<AdapterShared>` is dropped.
-        let _guard = self.context.as_ref().map(|wgl| {
-            wgl.make_current(self.device.dc).unwrap();
-            CurrentGuard(wgl)
-        });
+        let _guard = match self.context.as_ref() {
+            Some(wgl) => match wgl.make_current(self.device.dc) {
+                Ok(()) => Some(CurrentGuard(wgl)),
+                Err(err) => {
+                    // The context can't be made current (for example it was lost):
+                    // leak the GL context rather than drop it without a current context.
+                    log::error!("Failed to make WGL context current to drop it: {err}");
+                    return;
+                }
+            },
+            None => None,
+        };
         // SAFETY: Field not used after this.
         unsafe { ManuallyDrop::drop(&mut self.gl) };
     }
@@ -189,6 +230,25 @@ pub struct Instance {
 
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(Instance: Send, Sync);
+
+// With the `angle` feature, the backend's `AdapterContext` and `Surface` wrap either the WGL or
+// the EGL (ANGLE) ones; otherwise they are the WGL ones.
+#[cfg(not(windows_angle))]
+fn backend_adapter_context(context: AdapterContext) -> AdapterContext {
+    context
+}
+#[cfg(windows_angle)]
+fn backend_adapter_context(context: AdapterContext) -> super::AdapterContext {
+    super::AdapterContext::Wgl(context)
+}
+#[cfg(not(windows_angle))]
+fn backend_surface(surface: Surface) -> Surface {
+    surface
+}
+#[cfg(windows_angle)]
+fn backend_surface(surface: Surface) -> super::Surface {
+    super::Surface::wgl(surface)
+}
 
 fn load_gl_func(name: &str, module: Option<Foundation::HMODULE>) -> *const c_void {
     let addr = CString::new(name.as_bytes()).unwrap();
@@ -572,7 +632,7 @@ impl crate::Instance for Instance {
         &self,
         display_handle: RawDisplayHandle,
         window_handle: RawWindowHandle,
-    ) -> Result<Surface, crate::InstanceError> {
+    ) -> Result<<super::Api as crate::Api>::Surface, crate::InstanceError> {
         assert!(matches!(display_handle, RawDisplayHandle::Windows(_)));
         let window = if let RawWindowHandle::Win32(handle) = window_handle {
             handle
@@ -581,24 +641,25 @@ impl crate::Instance for Instance {
                 "unsupported window: {window_handle:?}"
             )));
         };
-        Ok(Surface {
+        Ok(backend_surface(Surface {
             // This cast exists because of https://github.com/rust-windowing/raw-window-handle/issues/171
             window: Foundation::HWND(window.hwnd.get() as *mut _),
             presentable: true,
             swapchain: RwLock::new(None),
             srgb_capable: self.srgb_capable,
-        })
+        }))
     }
 
     unsafe fn enumerate_adapters(
         &self,
-        _surface_hint: Option<&Surface>,
+        _surface_hint: Option<&<super::Api as crate::Api>::Surface>,
     ) -> Vec<crate::ExposedAdapter<super::Api>> {
         unsafe {
             super::Adapter::expose(
-                AdapterContext {
+                backend_adapter_context(AdapterContext {
                     inner: self.inner.clone(),
-                },
+                    lock_timeout: CONTEXT_LOCK_TIMEOUT,
+                }),
                 self.options.clone(),
             )
         }
@@ -624,23 +685,26 @@ impl super::Adapter {
         let context = unsafe { glow::Context::from_loader_function(fun) };
         unsafe {
             Self::expose(
-                AdapterContext {
+                backend_adapter_context(AdapterContext {
                     inner: Arc::new(Mutex::new(Inner {
                         gl: ManuallyDrop::new(context),
                         device: create_instance_device().ok()?,
                         context: None,
                     })),
-                },
+                    lock_timeout: CONTEXT_LOCK_TIMEOUT,
+                }),
                 options,
             )
         }
     }
 
+    #[cfg(not(windows_angle))]
     pub fn adapter_context(&self) -> &AdapterContext {
         &self.shared.context
     }
 }
 
+#[cfg(not(windows_angle))]
 impl super::Device {
     /// Returns the underlying WGL context.
     pub fn context(&self) -> &AdapterContext {

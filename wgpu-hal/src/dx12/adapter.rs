@@ -74,6 +74,7 @@ impl super::Adapter {
         telemetry: Option<crate::Telemetry>,
     ) -> Option<crate::ExposedAdapter<super::Api>> {
         let desc = unsafe { adapter.GetDesc2() }.unwrap();
+        let device_name = auxil::dxgi::conv::map_adapter_name(desc.Description);
         let driver_version = unsafe { adapter.CheckInterfaceSupport(&Dxgi::IDXGIDevice::IID) };
         let driver_version = driver_version
             .map(|driver_version| {
@@ -118,14 +119,16 @@ impl super::Adapter {
             pFeatureLevelsRequested: d3d_feature_level.as_ptr().cast(),
             MaxSupportedFeatureLevel: Default::default(),
         };
-        unsafe {
+        if let Err(err) = unsafe {
             device.CheckFeatureSupport(
                 Direct3D12::D3D12_FEATURE_FEATURE_LEVELS,
                 <*mut _>::cast(&mut device_levels),
                 size_of_val(&device_levels) as u32,
             )
+        } {
+            log::warn!("Skipping adapter {device_name:?}: CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS) failed: {err}");
+            return None;
         }
-        .unwrap();
         let max_feature_level = match device_levels.MaxSupportedFeatureLevel {
             Direct3D::D3D_FEATURE_LEVEL_11_0 => FeatureLevel::V11_0,
             Direct3D::D3D_FEATURE_LEVEL_11_1 => FeatureLevel::V11_1,
@@ -144,18 +147,18 @@ impl super::Adapter {
             }
         };
 
-        let device_name = auxil::dxgi::conv::map_adapter_name(desc.Description);
-
         let mut features_architecture = Direct3D12::D3D12_FEATURE_DATA_ARCHITECTURE::default();
 
-        unsafe {
+        if let Err(err) = unsafe {
             device.CheckFeatureSupport(
                 Direct3D12::D3D12_FEATURE_ARCHITECTURE,
                 <*mut _>::cast(&mut features_architecture),
                 size_of_val(&features_architecture) as u32,
             )
+        } {
+            log::warn!("Skipping adapter {device_name:?}: CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE) failed: {err}");
+            return None;
         }
-        .unwrap();
 
         let mut features1 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         let hr = unsafe {
@@ -212,14 +215,19 @@ impl super::Adapter {
         };
 
         let mut options = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
-        unsafe {
+        if let Err(err) = unsafe {
             device.CheckFeatureSupport(
                 Direct3D12::D3D12_FEATURE_D3D12_OPTIONS,
                 <*mut _>::cast(&mut options),
                 size_of_val(&options) as u32,
             )
+        } {
+            log::warn!(
+                "Skipping adapter {:?}: CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS) failed: {err}",
+                info.name
+            );
+            return None;
         }
-        .unwrap();
 
         /// Resource Binding Tiers: https://learn.microsoft.com/en-us/windows/win32/direct3d12/hardware-support#limits-dependant-on-hardware
         #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -1386,6 +1394,20 @@ impl crate::Adapter for super::Adapter {
 
     unsafe fn get_presentation_timestamp(&self) -> wgt::PresentationTimestamp {
         wgt::PresentationTimestamp(self.presentation_timer.get_timestamp_ns())
+    }
+
+    unsafe fn memory_info(&self) -> Option<wgt::AdapterMemoryInfo> {
+        let desc = unsafe { self.raw.GetDesc1() }.ok()?;
+        let local = self
+            .raw
+            .query_video_memory_info(Dxgi::DXGI_MEMORY_SEGMENT_GROUP_LOCAL)
+            .ok();
+        Some(wgt::AdapterMemoryInfo {
+            dedicated_bytes: desc.DedicatedVideoMemory as u64,
+            shared_bytes: desc.SharedSystemMemory as u64,
+            budget_bytes: local.map(|info| info.Budget),
+            usage_bytes: local.map(|info| info.CurrentUsage),
+        })
     }
 
     fn get_ordered_buffer_usages(&self) -> wgt::BufferUses {

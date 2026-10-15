@@ -42,6 +42,11 @@ Bottom level categories:
 
 ## Unreleased
 
+### openOMSI integration
+
+- Port the openOMSI v29 compatibility patches to v30.0.1: ANGLE/D3D11, adapter memory reporting, GL texture-unit limits and context waits, program-binary caching, shader error handling, DX12 fence interop, device identity and naga fixes. The v30 release already includes the previous Vulkan, DX12 and texture-initialization backports.
+- `WGPU_GL_PROFILE=1` logs aggregate CPU wall times for GL context acquisition, state resets, command replay, fences and flushes. Disabled by default; synchronization is unchanged.
+
 ## v30.0.1 (2026-08-21)
 
 ### Bug Fixes

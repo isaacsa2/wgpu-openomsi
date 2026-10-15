@@ -2,6 +2,8 @@
 # OpenGL ES3 API (aka GLES3).
 
 Designed to work on Linux and Android, with context provided by EGL.
+On Windows, the context comes from WGL, or, with the `angle` feature, optionally from
+[ANGLE](https://github.com/google/angle) through EGL (see `GlBackendOptions::platform`).
 
 ## Texture views
 
@@ -80,7 +82,7 @@ we don't bother with that combination.
 */
 
 ///cbindgen:ignore
-#[cfg(not(any(windows, webgl)))]
+#[cfg(any(not(any(windows, webgl)), windows_angle))]
 mod egl;
 #[cfg(Emscripten)]
 mod emscripten;
@@ -88,6 +90,8 @@ mod emscripten;
 mod web;
 #[cfg(windows)]
 mod wgl;
+#[cfg(windows_angle)]
+mod windows_platform;
 
 mod adapter;
 mod command;
@@ -95,6 +99,8 @@ mod conv;
 mod device;
 mod fence;
 mod queue;
+#[cfg(native)]
+mod submit_profile;
 
 pub use fence::Fence;
 
@@ -108,10 +114,13 @@ pub use self::web::AdapterContext;
 #[cfg(webgl)]
 pub use self::web::{Instance, Surface};
 
-#[cfg(windows)]
+#[cfg(all(windows, not(windows_angle)))]
 use self::wgl::AdapterContext;
-#[cfg(windows)]
+#[cfg(all(windows, not(windows_angle)))]
 pub use self::wgl::{Instance, Surface};
+
+#[cfg(windows_angle)]
+pub use self::windows_platform::{AdapterContext, AdapterContextLock, Instance, Surface};
 
 use alloc::{boxed::Box, string::String, string::ToString as _, sync::Arc, vec::Vec};
 use core::{
@@ -130,10 +139,19 @@ use crate::{CopyExtent, TextureDescriptor};
 #[derive(Clone, Debug)]
 pub struct Api;
 
-//Note: we can support more samplers if not every one of them is used at a time,
-// but it probably doesn't worth it.
-const MAX_TEXTURE_SLOTS: usize = 16;
-const MAX_SAMPLERS: usize = 16;
+/// Texture units every implementation we support has: GLES 3.0 and GL 3.3 guarantee 16 per
+/// stage (and 32 or 48 combined).
+const MIN_TEXTURE_SLOTS: usize = 16;
+/// Upper bound on the texture units a pipeline layout can use, over all of its bind groups and
+/// all shader stages together. The actual limit is the driver's
+/// `GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS` capped to this, reported as
+/// [`wgt::DownlevelLimits::max_sampled_textures_per_pipeline_layout`].
+///
+/// Must not exceed 32: the dirty masks in the command encoder are `u32` bitmasks.
+const MAX_TEXTURE_SLOTS: usize = 32;
+/// Upper bound on the samplers a pipeline layout can use, over all of its bind groups and
+/// all shader stages together. Same bitmask restriction as `MAX_TEXTURE_SLOTS`.
+const MAX_SAMPLERS: usize = 32;
 const MAX_VERTEX_ATTRIBUTES: usize = 16;
 const ZERO_BUFFER_SIZE: usize = 256 << 10;
 const MAX_IMMEDIATES: usize = 64;
@@ -295,6 +313,9 @@ struct AdapterShared {
     shading_language_version: naga::back::glsl::Version,
     next_shader_id: AtomicU32,
     program_cache: Mutex<ProgramCache>,
+    /// The driver's vendor, renderer and version strings hashed: what a pipeline cache's
+    /// program binaries were made with (`Device::pipeline_cache_validation_key`).
+    pipeline_cache_validation_key: [u8; 16],
     es: bool,
 
     /// Result of `gl.get_parameter_i32(glow::MAX_SAMPLES)`.
@@ -315,6 +336,7 @@ impl fmt::Debug for AdapterShared {
             shading_language_version,
             next_shader_id,
             program_cache: _,
+            pipeline_cache_validation_key: _,
             es,
             max_msaa_samples,
         } = self;
@@ -839,8 +861,103 @@ pub struct AccelerationStructure;
 
 impl crate::DynAccelerationStructure for AccelerationStructure {}
 
-#[derive(Debug)]
-pub struct PipelineCache;
+/// Linked programs kept as the driver's binaries (`glGetProgramBinary`), by the hash of the
+/// GLSL they were built from, so that a later run loads them with `glProgramBinary` instead of
+/// compiling and linking the shaders again. Empty where the driver has no binary formats
+/// (`Features::PIPELINE_CACHE` is not offered there).
+#[derive(Debug, Default)]
+pub struct PipelineCache {
+    /// By source hash: (binary format, bytes).
+    programs: Mutex<FastHashMap<u64, (u32, Vec<u8>)>>,
+}
+
+impl PipelineCache {
+    const MAGIC: &'static [u8; 8] = b"wgpuGLp1";
+
+    /// FNV-1a: the same in every run (a cache key must not depend on a random seed).
+    fn fnv(bytes: &[u8], mut h: u64) -> u64 {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    fn driver_key(vendor: &str, renderer: &str, version: &str) -> [u8; 16] {
+        let a = Self::fnv(
+            version.as_bytes(),
+            Self::fnv(
+                renderer.as_bytes(),
+                Self::fnv(vendor.as_bytes(), 0xcbf2_9ce4_8422_2325),
+            ),
+        );
+        let b = Self::fnv(
+            vendor.as_bytes(),
+            Self::fnv(
+                version.as_bytes(),
+                Self::fnv(renderer.as_bytes(), 0x6c62_272e_07bb_0142),
+            ),
+        );
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&a.to_le_bytes());
+        key[8..].copy_from_slice(&b.to_le_bytes());
+        key
+    }
+
+    /// The key of a program: its GLSL version and every stage's source.
+    fn key(glsl_version: &str, sources: &[(naga::ShaderStage, String, Option<&str>)]) -> u64 {
+        let mut h = Self::fnv(glsl_version.as_bytes(), 0xcbf2_9ce4_8422_2325);
+        for (stage, source, _) in sources {
+            h = Self::fnv(&[*stage as u8], h);
+            h = Self::fnv(&(source.len() as u64).to_le_bytes(), h);
+            h = Self::fnv(source.as_bytes(), h);
+        }
+        h
+    }
+
+    /// What `to_data` wrote; anything else (another layout, a truncated file) is an empty
+    /// cache - the programs are compiled again and kept anew.
+    fn from_data(data: &[u8]) -> Self {
+        let cache = Self::default();
+        let Some(mut rest) = data.strip_prefix(&Self::MAGIC[..]) else {
+            return cache;
+        };
+        let mut take = |n: usize| -> Option<&[u8]> {
+            let (head, tail) = (rest.get(..n)?, rest.get(n..)?);
+            rest = tail;
+            Some(head)
+        };
+        let mut programs = FastHashMap::default();
+        let Some(count) = take(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())) else {
+            return cache;
+        };
+        for _ in 0..count {
+            let Some(head) = take(16) else { return cache };
+            let key = u64::from_le_bytes(head[..8].try_into().unwrap());
+            let format = u32::from_le_bytes(head[8..12].try_into().unwrap());
+            let len = u32::from_le_bytes(head[12..16].try_into().unwrap()) as usize;
+            let Some(bytes) = take(len) else { return cache };
+            programs.insert(key, (format, bytes.to_vec()));
+        }
+        *cache.programs.lock() = programs;
+        cache
+    }
+
+    fn to_data(&self) -> Vec<u8> {
+        let programs = self.programs.lock();
+        let mut out =
+            Vec::with_capacity(12 + programs.values().map(|(_, b)| 16 + b.len()).sum::<usize>());
+        out.extend_from_slice(Self::MAGIC);
+        out.extend_from_slice(&(programs.len() as u32).to_le_bytes());
+        for (key, (format, bytes)) in programs.iter() {
+            out.extend_from_slice(&key.to_le_bytes());
+            out.extend_from_slice(&format.to_le_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        out
+    }
+}
 
 impl crate::DynPipelineCache for PipelineCache {}
 
@@ -1211,5 +1328,52 @@ cfg_if::cfg_if! {
         fn lock<T>(mutex: &MaybeMutex<T>) -> core::cell::RefMut<'_, T> {
             mutex.borrow_mut()
         }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_cache_tests {
+    use super::PipelineCache;
+    use alloc::{string::String, vec};
+
+    #[test]
+    fn programs_survive_the_round_trip_and_bad_data_is_an_empty_cache() {
+        let cache = PipelineCache::default();
+        cache.programs.lock().insert(7, (0x8741, vec![1, 2, 3]));
+        cache.programs.lock().insert(9, (0x8741, vec![]));
+        let data = cache.to_data();
+        let back = PipelineCache::from_data(&data);
+        assert_eq!(back.programs.lock().get(&7), Some(&(0x8741, vec![1, 2, 3])));
+        assert_eq!(back.programs.lock().len(), 2);
+        // truncated, or another layout: nothing (the programs are compiled again)
+        assert!(PipelineCache::from_data(&data[..data.len() - 1])
+            .programs
+            .lock()
+            .is_empty());
+        assert!(PipelineCache::from_data(b"not a cache")
+            .programs
+            .lock()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_key_follows_the_sources_and_the_driver() {
+        let src = |s: &str| vec![(naga::ShaderStage::Vertex, String::from(s), None)];
+        assert_eq!(
+            PipelineCache::key("300 es", &src("a")),
+            PipelineCache::key("300 es", &src("a"))
+        );
+        assert_ne!(
+            PipelineCache::key("300 es", &src("a")),
+            PipelineCache::key("300 es", &src("b"))
+        );
+        assert_ne!(
+            PipelineCache::key("300 es", &src("a")),
+            PipelineCache::key("310 es", &src("a"))
+        );
+        assert_ne!(
+            PipelineCache::driver_key("Qualcomm", "Adreno 740", "OpenGL ES 3.2 V@0615"),
+            PipelineCache::driver_key("Qualcomm", "Adreno 740", "OpenGL ES 3.2 V@0676")
+        );
     }
 }

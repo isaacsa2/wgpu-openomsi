@@ -141,7 +141,12 @@ impl super::Adapter {
             "v3d",
             "apple m", // all apple m are integrated
         ];
-        let strings_that_imply_cpu = ["mesa offscreen", "swiftshader", "llvmpipe"];
+        let strings_that_imply_cpu = [
+            "mesa offscreen",
+            "swiftshader",
+            "llvmpipe",
+            "microsoft basic render driver", // WARP, e.g. through ANGLE
+        ];
 
         //TODO: handle Intel Iris XE as discreet
         let inferred_device_type = if vendor.contains("qualcomm")
@@ -194,9 +199,12 @@ impl super::Adapter {
     }
 
     pub(super) unsafe fn expose(
-        context: super::AdapterContext,
+        mut context: super::AdapterContext,
         backend_options: wgt::GlBackendOptions,
     ) -> Option<crate::ExposedAdapter<super::Api>> {
+        if let Some(timeout) = backend_options.context_lock_timeout {
+            context.set_lock_timeout(timeout);
+        }
         let gl = context.lock();
         let extensions = gl.supported_extensions();
 
@@ -221,6 +229,9 @@ impl super::Adapter {
         let vendor = unsafe { gl.get_parameter_string(vendor_const) };
         let renderer = unsafe { gl.get_parameter_string(renderer_const) };
         let version = unsafe { gl.get_parameter_string(glow::VERSION) };
+        // (cached program binaries are only good for the driver that made them)
+        let pipeline_cache_validation_key =
+            super::PipelineCache::driver_key(&vendor, &renderer, &version);
         log::debug!("Vendor: {vendor}");
         log::debug!("Renderer: {renderer}");
         log::debug!("Version: {version}");
@@ -378,6 +389,27 @@ impl super::Adapter {
         } else {
             vertex_shader_storage_textures.min(fragment_shader_storage_textures)
         };
+
+        // Texture units are a single pool shared by every stage of a program: a texture
+        // binding takes one unit whichever stages it is visible to. `MAX_TEXTURE_SLOTS` is
+        // the size of our fixed-size tables of those units.
+        let combined_texture_units =
+            unsafe { gl.get_parameter_i32(glow::MAX_COMBINED_TEXTURE_IMAGE_UNITS) }.max(0) as u32;
+        let mut stage_texture_units =
+            unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_IMAGE_UNITS) }
+                .min(unsafe { gl.get_parameter_i32(glow::MAX_VERTEX_TEXTURE_IMAGE_UNITS) });
+        if supports_compute {
+            stage_texture_units = stage_texture_units
+                .min(unsafe { gl.get_parameter_i32(glow::MAX_COMPUTE_TEXTURE_IMAGE_UNITS) });
+        }
+        // GLES 3.0 and GL 3.3 guarantee at least 16 units per stage and 32 combined, and we
+        // have always reported 16 per stage; keep that as the floor.
+        let max_texture_slots = combined_texture_units
+            .max(super::MIN_TEXTURE_SLOTS as u32)
+            .min(super::MAX_TEXTURE_SLOTS as u32);
+        let max_sampled_textures_per_shader_stage = (stage_texture_units.max(0) as u32)
+            .max(super::MIN_TEXTURE_SLOTS as u32)
+            .min(max_texture_slots);
         // NOTE: GL_ARB_compute_shader adds support for indirect dispatch
         let indirect_execution = supported((3, 1), (4, 3))
             || (extensions.contains("GL_ARB_draw_indirect") && supports_compute);
@@ -527,6 +559,15 @@ impl super::Adapter {
             wgt::Features::SHADER_EARLY_DEPTH_TEST,
             supported((3, 1), (4, 2)) || extensions.contains("GL_ARB_shader_image_load_store"),
         );
+        // Program binaries (GLES 3.0, GL 4.1, `GL_ARB_get_program_binary`) back the pipeline
+        // cache, where the driver offers at least one binary format.
+        #[cfg(native)]
+        features.set(wgt::Features::PIPELINE_CACHE, {
+            let binaries = supported((3, 0), (4, 1))
+                || extensions.contains("GL_ARB_get_program_binary")
+                || extensions.contains("GL_OES_get_program_binary");
+            binaries && unsafe { gl.get_parameter_i32(glow::NUM_PROGRAM_BINARY_FORMATS) } > 0
+        });
         if extensions.contains("GL_ARB_timer_query") {
             features.set(wgt::Features::TIMESTAMP_QUERY, true);
             features.set(wgt::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS, true);
@@ -781,8 +822,8 @@ impl super::Adapter {
             max_bindings_per_bind_group: u32::MAX,
             max_dynamic_uniform_buffers_per_pipeline_layout: max_uniform_buffers_per_shader_stage,
             max_dynamic_storage_buffers_per_pipeline_layout: max_storage_buffers_per_shader_stage,
-            max_sampled_textures_per_shader_stage: super::MAX_TEXTURE_SLOTS as u32,
-            max_samplers_per_shader_stage: super::MAX_SAMPLERS as u32,
+            max_sampled_textures_per_shader_stage,
+            max_samplers_per_shader_stage: max_sampled_textures_per_shader_stage,
             max_storage_buffers_per_shader_stage,
             max_storage_textures_per_shader_stage,
             max_uniform_buffers_per_shader_stage,
@@ -935,7 +976,10 @@ impl super::Adapter {
             workarounds.set(super::Workarounds::MESA_I915_SRGB_SHADER_CLEAR, true);
         }
 
-        let downlevel_defaults = wgt::DownlevelLimits {};
+        let downlevel_limits = wgt::DownlevelLimits {
+            max_sampled_textures_per_pipeline_layout: max_texture_slots,
+            max_samplers_per_pipeline_layout: super::MAX_SAMPLERS as u32,
+        };
         let max_samples = unsafe { gl.get_parameter_i32(glow::MAX_SAMPLES) };
 
         // Drop the GL guard so we can move the context into AdapterShared
@@ -956,6 +1000,7 @@ impl super::Adapter {
                     shading_language_version,
                     next_shader_id: Default::default(),
                     program_cache: Default::default(),
+                    pipeline_cache_validation_key,
                     es: es_ver.is_some(),
                     max_msaa_samples: max_samples,
                 }),
@@ -966,7 +1011,7 @@ impl super::Adapter {
                 limits,
                 downlevel: wgt::DownlevelCapabilities {
                     flags: downlevel_flags,
-                    limits: downlevel_defaults,
+                    limits: downlevel_limits,
                     shader_model: wgt::ShaderModel::Sm5,
                 },
                 alignments: crate::Alignments {
@@ -1011,7 +1056,13 @@ impl super::Adapter {
                 format!("#version 140\n{source}")
             }
         };
-        let shader = unsafe { gl.create_shader(shader_type) }.expect("Could not create shader");
+        let shader = match unsafe { gl.create_shader(shader_type) } {
+            Ok(shader) => shader,
+            Err(err) => {
+                log::error!("Could not create shader: {err}");
+                return None;
+            }
+        };
         unsafe { gl.shader_source(shader, &source) };
         unsafe { gl.compile_shader(shader) };
 
@@ -1031,7 +1082,13 @@ impl super::Adapter {
         gl: &glow::Context,
         es: bool,
     ) -> Option<ShaderClearProgram> {
-        let program = unsafe { gl.create_program() }.expect("Could not create shader program");
+        let program = match unsafe { gl.create_program() } {
+            Ok(program) => program,
+            Err(err) => {
+                log::error!("Could not create shader program: {err}");
+                return None;
+            }
+        };
         let vertex = unsafe {
             Self::compile_shader(
                 include_str!("./shaders/clear.vert"),
@@ -1061,10 +1118,14 @@ impl super::Adapter {
             return None;
         }
 
-        let color_uniform_location = unsafe { gl.get_uniform_location(program, "color") }
-            .expect("Could not find color uniform in shader clear shader");
+        let color_uniform_location = unsafe { gl.get_uniform_location(program, "color") };
         unsafe { gl.delete_shader(vertex) };
         unsafe { gl.delete_shader(fragment) };
+        let Some(color_uniform_location) = color_uniform_location else {
+            log::error!("Could not find color uniform in shader clear shader");
+            unsafe { gl.delete_program(program) };
+            return None;
+        };
 
         Some(ShaderClearProgram {
             program,
@@ -1082,7 +1143,7 @@ impl crate::Adapter for super::Adapter {
         _limits: &wgt::Limits,
         _memory_hints: &wgt::MemoryHints,
     ) -> Result<crate::OpenDevice<super::Api>, crate::DeviceError> {
-        let gl = &self.shared.context.lock();
+        let gl = &self.shared.context.try_lock()?;
         unsafe { gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1) };
         unsafe { gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1) };
         let main_vao =
@@ -1466,5 +1527,27 @@ mod tests {
             Adapter::parse_version("WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)").unwrap(),
             (3, 0)
         );
+    }
+
+    #[test]
+    fn test_angle_d3d11_info() {
+        let info = Adapter::make_info(
+            "Google Inc. (Intel)".into(),
+            "ANGLE (Intel, Intel(R) HD Graphics 4000 Direct3D11 vs_5_0 ps_5_0, D3D11-10.18.10.5161)"
+                .into(),
+            "OpenGL ES 3.0.0 (ANGLE 2.1.24127 git hash: 2a2b7c9c1c3c)".into(),
+        );
+        assert_eq!(info.backend, wgt::Backend::Gl);
+        assert!(info.name.contains("ANGLE") && info.name.contains("Direct3D11"));
+        assert_eq!(info.vendor, crate::auxil::db::intel::VENDOR);
+        assert_eq!(info.device_type, wgt::DeviceType::IntegratedGpu);
+
+        let warp = Adapter::make_info(
+            "Google Inc. (Microsoft)".into(),
+            "ANGLE (Microsoft, Microsoft Basic Render Driver Direct3D11 vs_5_0 ps_5_0, D3D11)"
+                .into(),
+            "OpenGL ES 3.0.0 (ANGLE 2.1.24127 git hash: 2a2b7c9c1c3c)".into(),
+        );
+        assert_eq!(warp.device_type, wgt::DeviceType::Cpu);
     }
 }

@@ -17,7 +17,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
 
     #[cfg(not(wasm_test))]
     {
-        vec.extend([DEVICE_LIFETIME_CHECK, MULTIPLE_DEVICES]);
+        vec.extend([DEVICE_LIFETIME_CHECK, MULTIPLE_DEVICES, ADAPTER_MEMORY_INFO]);
     }
 }
 
@@ -52,6 +52,44 @@ static CROSS_DEVICE_BIND_GROUP_USAGE: GpuTestConfiguration = GpuTestConfiguratio
     });
 
 #[cfg(not(wasm_test))]
+#[gpu_test]
+static ADAPTER_MEMORY_INFO: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(TestParameters::default().enable_noop())
+    .run_sync(|ctx| {
+        let backend = ctx.adapter_info.backend;
+        let Some(info) = ctx.adapter.memory_info() else {
+            assert!(
+                matches!(backend, wgpu::Backend::Gl | wgpu::Backend::Noop),
+                "{backend:?} adapter reported no memory info"
+            );
+            return;
+        };
+        log::info!("{backend:?} adapter memory: {info:?}");
+        assert!(info.dedicated_bytes + info.shared_bytes > 0);
+        if let Some(budget) = info.budget_bytes {
+            assert!(budget > 0);
+        }
+
+        // Metal's usage is the device's allocated size, which counts a new buffer.
+        if backend == wgpu::Backend::Metal {
+            const SIZE: u64 = 64 << 20;
+            let before = info.usage_bytes.unwrap();
+            let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: SIZE,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let after = ctx.adapter.memory_info().unwrap().usage_bytes.unwrap();
+            assert!(
+                after >= before + SIZE,
+                "usage went from {before} to {after} bytes"
+            );
+            drop(buffer);
+        }
+    });
+
+#[cfg(not(all(target_arch = "wasm32", not(target_os = "emscripten"))))]
 #[gpu_test]
 static DEVICE_LIFETIME_CHECK: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(TestParameters::default().enable_noop())

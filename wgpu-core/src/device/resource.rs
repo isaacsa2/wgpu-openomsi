@@ -2470,12 +2470,12 @@ impl Device {
             Ok(raw) => raw,
             Err(error) => {
                 return Err(match error {
-                    hal::ShaderError::Device(error) => {
-                        pipeline::CreateShaderModuleError::Device(self.handle_hal_error(error))
-                    }
-                    hal::ShaderError::Compilation(ref msg) => {
+                    hal::ShaderError::Device(error) => pipeline::CreateShaderModuleError::Device(
+                        self.handle_hal_error_with_nonfatal_oom(error),
+                    ),
+                    hal::ShaderError::Compilation(msg) => {
                         log::error!("Shader error: {msg}");
-                        pipeline::CreateShaderModuleError::Generation
+                        pipeline::CreateShaderModuleError::Compilation(msg)
                     }
                 })
             }
@@ -2570,12 +2570,12 @@ impl Device {
             Ok(raw) => raw,
             Err(error) => {
                 return Err(match error {
-                    hal::ShaderError::Device(error) => {
-                        pipeline::CreateShaderModuleError::Device(self.handle_hal_error(error))
-                    }
-                    hal::ShaderError::Compilation(ref msg) => {
+                    hal::ShaderError::Device(error) => pipeline::CreateShaderModuleError::Device(
+                        self.handle_hal_error_with_nonfatal_oom(error),
+                    ),
+                    hal::ShaderError::Compilation(msg) => {
                         log::error!("Shader error: {msg}");
-                        pipeline::CreateShaderModuleError::Generation
+                        pipeline::CreateShaderModuleError::Compilation(msg)
                     }
                 })
             }
@@ -3904,6 +3904,7 @@ impl Device {
         count_validator
             .validate(&self.limits, self.instance_flags)
             .map_err(Error::TooManyBindings)?;
+        count_validator.validate_downlevel(&self.downlevel.limits)?;
 
         let buffers_and_acceleration_structures_in_vertex_stage =
             count_validator.buffers_and_acceleration_structures_in_vertex_stage();
@@ -4124,7 +4125,9 @@ impl Device {
             unsafe { self.raw().create_compute_pipeline(&pipeline_desc) }.map_err(
                 |err| match err {
                     hal::PipelineError::Device(error) => {
-                        pipeline::CreateComputePipelineError::Device(self.handle_hal_error(error))
+                        pipeline::CreateComputePipelineError::Device(
+                            self.handle_hal_error_with_nonfatal_oom(error),
+                        )
                     }
                     hal::PipelineError::Linkage(_stages, msg) => {
                         pipeline::CreateComputePipelineError::Internal(msg)
@@ -4988,7 +4991,9 @@ impl Device {
             unsafe { self.raw().create_render_pipeline(&pipeline_desc) }.map_err(
                 |err| match err {
                     hal::PipelineError::Device(error) => {
-                        pipeline::CreateRenderPipelineError::Device(self.handle_hal_error(error))
+                        pipeline::CreateRenderPipelineError::Device(
+                            self.handle_hal_error_with_nonfatal_oom(error),
+                        )
                     }
                     hal::PipelineError::Linkage(stage, msg) => {
                         pipeline::CreateRenderPipelineError::Internal { stage, error: msg }

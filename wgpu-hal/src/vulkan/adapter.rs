@@ -1849,14 +1849,24 @@ impl PhysicalDeviceProperties {
 }
 
 impl super::InstanceShared {
+    /// Returns `None` if the driver fails to report the device's extensions.
     fn inspect(
         &self,
         phd: vk::PhysicalDevice,
-    ) -> (PhysicalDeviceProperties, PhysicalDeviceFeatures) {
+    ) -> Option<(PhysicalDeviceProperties, PhysicalDeviceFeatures)> {
         let capabilities = {
             let mut capabilities = PhysicalDeviceProperties::default();
             capabilities.supported_extensions =
-                unsafe { self.raw.enumerate_device_extension_properties(phd).unwrap() };
+                match unsafe { self.raw.enumerate_device_extension_properties(phd) } {
+                    Ok(extensions) => extensions,
+                    Err(err) => {
+                        log::warn!(
+                            "Skipping physical device {phd:?}: \
+                            vkEnumerateDeviceExtensionProperties failed: {err}"
+                        );
+                        return None;
+                    }
+                };
             capabilities.properties = unsafe { self.raw.get_physical_device_properties(phd) };
             capabilities.device_api_version = capabilities.properties.api_version;
 
@@ -2211,7 +2221,7 @@ impl super::InstanceShared {
             unsafe { self.raw.get_physical_device_features(phd) }
         };
 
-        (capabilities, features)
+        Some((capabilities, features))
     }
 }
 
@@ -2222,7 +2232,7 @@ impl super::Instance {
     ) -> Option<crate::ExposedAdapter<super::Api>> {
         use crate::auxil::db;
 
-        let (phd_capabilities, phd_features) = self.shared.inspect(phd);
+        let (phd_capabilities, phd_features) = self.shared.inspect(phd)?;
 
         let mem_properties = {
             profiling::scope!("vkGetPhysicalDeviceMemoryProperties");
@@ -2465,7 +2475,7 @@ impl super::Instance {
             alignments,
             downlevel: wgt::DownlevelCapabilities {
                 flags: downlevel_flags,
-                limits: wgt::DownlevelLimits {},
+                limits: wgt::DownlevelLimits::DEFAULT,
                 shader_model: wgt::ShaderModel::Sm5, //TODO?
             },
             cooperative_matrix_properties: phd_capabilities.cooperative_matrix_properties.clone(),
@@ -3212,6 +3222,75 @@ impl crate::Adapter for super::Adapter {
         // Vulkan has no portable luminance query; the Win32 surface reads it
         // through DXGI (see `dxgi::hdr`). Every other surface reports `None`.
         surface.inner.display_hdr_info()
+    }
+
+    unsafe fn memory_info(&self) -> Option<wgt::AdapterMemoryInfo> {
+        let mut budget_properties = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        // `VK_EXT_memory_budget` only has to be supported by the physical device for its
+        // structure to be chained here; it doesn't have to be enabled on a device.
+        let budget_query = self
+            .instance
+            .get_physical_device_properties
+            .as_ref()
+            .filter(|_| {
+                self.phd_capabilities
+                    .supports_extension(ext::memory_budget::NAME)
+            });
+        let memory_properties = if let Some(get_physical_device_properties) = budget_query {
+            let mut properties2 =
+                vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget_properties);
+            unsafe {
+                get_physical_device_properties
+                    .get_physical_device_memory_properties2(self.raw, &mut properties2)
+            };
+            properties2.memory_properties
+        } else {
+            unsafe {
+                self.instance
+                    .raw
+                    .get_physical_device_memory_properties(self.raw)
+            }
+        };
+        let has_budget = budget_query.is_some();
+
+        let heaps = &memory_properties.memory_heaps[..memory_properties.memory_heap_count as usize];
+        let is_local =
+            |heap: &vk::MemoryHeap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+        // An integrated or CPU adapter with nothing but device-local heaps has unified memory,
+        // which is the system's memory: report it as shared.
+        let unified = matches!(
+            self.phd_capabilities.properties.device_type,
+            vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU
+        ) && heaps.iter().all(is_local);
+
+        let is_dedicated = |heap: &vk::MemoryHeap| is_local(heap) && !unified;
+
+        let mut info = wgt::AdapterMemoryInfo::default();
+        for heap in heaps {
+            if is_dedicated(heap) {
+                info.dedicated_bytes += heap.size;
+            } else {
+                info.shared_bytes += heap.size;
+            }
+        }
+        if has_budget {
+            // Budget and usage cover the dedicated heaps, or all heaps if there are none.
+            let counted = |&(_, heap): &(usize, &vk::MemoryHeap)| {
+                info.dedicated_bytes == 0 || is_dedicated(heap)
+            };
+            let counted_heaps = || heaps.iter().enumerate().filter(counted).map(|(i, _)| i);
+            info.budget_bytes = Some(
+                counted_heaps()
+                    .map(|i| budget_properties.heap_budget[i])
+                    .sum(),
+            );
+            info.usage_bytes = Some(
+                counted_heaps()
+                    .map(|i| budget_properties.heap_usage[i])
+                    .sum(),
+            );
+        }
+        Some(info)
     }
 
     unsafe fn get_presentation_timestamp(&self) -> wgt::PresentationTimestamp {
