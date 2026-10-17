@@ -145,9 +145,18 @@ fn choose_config(
         log::debug!("\tTrying {name}");
 
         attributes.clear();
+        let mut surface_type = 0;
         for &(_, tier_attr) in tiers[..=tier_max].iter() {
-            attributes.extend_from_slice(tier_attr);
+            for attribute in tier_attr.chunks_exact(2) {
+                if attribute[0] == khronos_egl::SURFACE_TYPE {
+                    surface_type |= attribute[1];
+                } else {
+                    attributes.extend_from_slice(attribute);
+                }
+            }
         }
+        // Duplicate EGL_SURFACE_TYPE keys are undefined and make Mesa reject the config.
+        attributes.extend_from_slice(&[khronos_egl::SURFACE_TYPE, surface_type]);
         // make sure the Alpha is enough to support sRGB
         match srgb_kind {
             SrgbFrameBufferKind::None => {}
@@ -1343,6 +1352,8 @@ impl Surface {
         unsafe { gl.color_mask(true, true, true, true) };
 
         unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
+        // The default framebuffer does not always select BACK on GL drivers.
+        unsafe { gl.draw_buffers(&[glow::BACK]) };
         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(sc.framebuffer)) };
 
         if !matches!(self.srgb_kind, SrgbFrameBufferKind::None) {
