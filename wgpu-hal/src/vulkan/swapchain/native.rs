@@ -244,7 +244,12 @@ impl Surface for NativeSurface {
         // avoid bad frame pacing when the Vulkan driver is using a DXGI swapchain. See
         // https://github.com/gfx-rs/wgpu/issues/8310 and
         // https://github.com/gfx-rs/wgpu/issues/8354 for more details.
-        let fence = if cfg!(target_os = "windows") {
+        // Experimental A/B only: compare WGPU Win32 acquire throttling against Vulkan's
+        // semaphore-based path. Disabling the extra fence can change frame pacing and
+        // latency; never the default and never bypass the submission semaphore wait.
+        let fence = if cfg!(target_os = "windows")
+            && std::env::var_os("OPENOMSI_WGPU_NO_WIN_ACQUIRE_FENCE").is_none()
+        {
             let raw = unsafe {
                 device
                     .shared
