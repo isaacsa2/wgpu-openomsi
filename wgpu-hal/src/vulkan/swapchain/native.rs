@@ -431,12 +431,19 @@ impl Swapchain for NativeSwapchain {
         // thus waited for `locked_swapchain_semaphores.acquire`, wait for all
         // of them to finish, thus ensuring that it's okay to pass `acquire` to
         // `vkAcquireNextImageKHR` again.
+        let trace_start = if cfg!(windows) && std::env::var_os("OPENOMSI_WGPU_ACQUIRE_TRACE").is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.device.wait_for_fence(
             fence,
             acquire_semaphore_guard.previously_used_submission_index,
             timeout_ns,
         )?;
+        let submission_wait_ms = trace_start.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
+        let image_start = trace_start.map(|_| std::time::Instant::now());
         let acquire_fence = self.fence.unwrap_or_else(vk::Fence::null);
 
         // will block if no image is available
@@ -469,6 +476,8 @@ impl Swapchain for NativeSwapchain {
             }
         };
 
+        let image_acquire_ms = image_start.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+        let win_fence_start = trace_start.map(|_| std::time::Instant::now());
         if let Some(fence) = self.fence {
             unsafe {
                 // The `wait_all` argument must be `true` to avoid crash on some Android devices. See https://github.com/gfx-rs/wgpu/pull/8769
@@ -484,6 +493,18 @@ impl Swapchain for NativeSwapchain {
             }
         }
 
+        if let (Some(start), Some(submit_ms), Some(image_ms)) = (trace_start, submission_wait_ms, image_acquire_ms) {
+            static TRACE_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let n = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Sampling only; no change to fence or presentation semantics.
+            if n % 60 == 0 || start.elapsed().as_millis() >= 200 {
+                log::info!(
+                    "wgpu vulkan acquire trace: submission_wait_ms={submit_ms:.3} image_acquire_ms={image_ms:.3} win_fence_ms={:.3} total_ms={:.3} frame={n}",
+                    win_fence_start.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+                    start.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        }
         drop(acquire_semaphore_guard);
         // We only advance the surface semaphores if we successfully acquired an image, otherwise
         // we should try to re-acquire using the same semaphores.
