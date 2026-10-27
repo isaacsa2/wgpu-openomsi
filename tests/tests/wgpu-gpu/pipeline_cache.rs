@@ -4,6 +4,7 @@ use wgpu_test::{gpu_test, GpuTestConfiguration, TestParameters, TestingContext};
 
 pub fn all_tests(vec: &mut Vec<wgpu_test::GpuTestInitializer>) {
     vec.push(PIPELINE_CACHE);
+    #[cfg(not(target_arch = "wasm32"))]
     vec.push(PIPELINE_CACHE_REFUSED_BINARY);
 }
 
@@ -157,6 +158,7 @@ async fn pipeline_cache_test(ctx: TestingContext) {
 /// was written, or a damaged file) still gives a working pipeline: the program is compiled
 /// again. Taking the refused binary out of the cache locked the cache a second time while
 /// the first lock was held, and the pipeline's creation never returned.
+#[cfg(not(target_arch = "wasm32"))]
 #[gpu_test]
 static PIPELINE_CACHE_REFUSED_BINARY: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(
@@ -169,6 +171,7 @@ static PIPELINE_CACHE_REFUSED_BINARY: GpuTestConfiguration = GpuTestConfiguratio
 /// The GLES backend's cache inside `data` (`wgpuGLp1`, then its programs) with every program
 /// binary's bytes zeroed: the same programs under the same keys, none a driver takes back.
 /// False when `data` holds no GLES cache (another backend's).
+#[cfg(not(target_arch = "wasm32"))]
 fn spoil_gles_binaries(data: &mut [u8]) -> bool {
     const MAGIC: &[u8] = b"wgpuGLp1";
     let Some(at) = data.windows(MAGIC.len()).position(|w| w == MAGIC) else {
@@ -189,6 +192,7 @@ fn spoil_gles_binaries(data: &mut [u8]) -> bool {
     count > 0
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn pipeline_cache_refused_binary_test(ctx: TestingContext) {
     let sm = ctx
         .device
